@@ -1,0 +1,36 @@
+# ======================
+# Data & Outputs (DO NOT COMMIT)
+# ======================
+datasets/
+saved_ckpts/
+results/
+output/
+
+# ======================
+# Large / Binary files
+# ======================
+*.pt
+*.ckpt
+*.pth
+*.mp4
+*.wav
+*.avi
+
+# ======================
+# Python cache
+# ======================
+__pycache__/
+*.pyc
+
+# ======================
+# Conda / virtual env
+# ======================
+.env/
+.envs/
+miniconda3/
+
+# ======================
+# System / temp
+# ======================
+.cache/
+*.log
