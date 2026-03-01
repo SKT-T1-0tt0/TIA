@@ -76,7 +76,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None, context_temp=None):
+    def forward(self, x, emb, context=None, context_temp=None, return_attn=False, attn_cache=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
@@ -85,9 +85,15 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
             elif isinstance(layer, DualSpatialTransformer):
                 x = layer(x, context)
             elif isinstance(layer, TemporalTransformer):
-                x = layer(x, context_temp)
+                x = layer(x, context_temp=context_temp, return_attn=return_attn, attn_cache=attn_cache)
             elif isinstance(layer, DualTemporalTransformer):
-                x = layer(x, context_temp)
+                x = layer(
+                    hidden_states=x,
+                    encoder_hidden_states=context,
+                    context_temp=context_temp,
+                    return_attn=return_attn,
+                    attn_cache=attn_cache,
+                )
             else:
                 x = layer(x)
         return x
@@ -865,15 +871,63 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, context=None, context_temp=None, y=None):
+    def _set_attn2_scale(self, module, scale):
+        """递归设置所有 BasicTemporalTransformerBlock 的 attn2_scale"""
+        from .attention import BasicTemporalTransformerBlock
+        for child in module.modules():
+            if isinstance(child, BasicTemporalTransformerBlock):
+                child.attn2_scale = scale
+
+    def _set_mix_ratio(self, module, ratio):
+        """递归设置所有 DualTemporalTransformer 的 mix_ratio (audio 权重)"""
+        for child in module.modules():
+            if isinstance(child, DualTemporalTransformer):
+                child.mix_ratio = ratio
+
+    def forward(self, x, timesteps, context=None, context_temp=None, y=None, **kwargs):
         """
         Apply the model to an input batch.
 
         :param x: an [N x C x ...] Tensor of inputs.
         :param timesteps: a 1-D batch of timesteps.
+        :param context: spatial condition (c_ti).
+        :param context_temp: temporal condition (c_at).
         :param y: an [N] Tensor of labels, if class-conditional.
+        :param return_attn: if True, temporal cross-attn stores last_attn (for baseline imitation).
         :return: an [N x C x ...] Tensor of outputs.
         """
+        # ========== 层级自适应 attn2_scale ==========
+        # Encoder: 低分辨率/语义 → 0.35
+        # Bottleneck: 最低分辨率/时序核心 → 0.45
+        # Decoder early (前 2/3): 中分辨率 → 0.2
+        # Decoder late (后 1/3): 高分辨率/细节 → 0.1
+        for module in self.input_blocks:
+            self._set_attn2_scale(module, 0.35)
+        self._set_attn2_scale(self.middle_block, 0.45)
+        num_output = len(self.output_blocks)
+        for i, module in enumerate(self.output_blocks):
+            if i < num_output * 0.66:
+                self._set_attn2_scale(module, 0.2)
+            else:
+                self._set_attn2_scale(module, 0.1)
+        # ================================================
+
+        # ========== 层级自适应 mix_ratio (Encoder+Bottleneck 提升 text 权重) ==========
+        # Encoder + Bottleneck: audio 0.6 / text 0.4 → 拉 CLIP-text、AV_ALIGN
+        # Decoder: 保持默认 audio 0.7 / text 0.3 → 不影响高频稳定性
+        for module in self.input_blocks:
+            self._set_mix_ratio(module, 0.6)
+        self._set_mix_ratio(self.middle_block, 0.6)
+        for module in self.output_blocks:
+            self._set_mix_ratio(module, 0.7)
+        # ================================================
+
+        return_attn = kwargs.get("return_attn", False)
+        if return_attn:
+            self._attn_cache = []
+            attn_cache = self._attn_cache
+        else:
+            attn_cache = None
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
@@ -887,12 +941,15 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb, context, context_temp)
+            h = module(h, emb, context, context_temp, return_attn=return_attn, attn_cache=attn_cache)
             hs.append(h)
-        h = self.middle_block(h, emb, context, context_temp)
+        h = self.middle_block(h, emb, context, context_temp, return_attn=return_attn, attn_cache=attn_cache)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context, context_temp)
+            h = module(h, emb, context, context_temp, return_attn=return_attn, attn_cache=attn_cache)
         h = h.type(x.dtype)
+
+        if not return_attn:
+            self._attn_cache = None
 
         return self.out(h)

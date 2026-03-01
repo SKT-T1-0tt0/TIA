@@ -5,7 +5,7 @@ TIA2V 项目修改总结
 修改原则：所有修改均不改变模型本身，仅解决环境兼容性问题和运行时错误
 
 ========================================
-一、修改清单（共10项）
+一、修改清单（共15项）
 ========================================
 
 【第一阶段：基础运行错误修复】
@@ -72,6 +72,30 @@ TIA2V 项目修改总结
     - 性质：临时性能优化（可随时恢复）
     - 说明：仅跳过VideoEditor处理，fake1_6fps和fake1_30fps视频生成仍然保留
 
+12. diffusion/tacm_train_*.py - matplotlib可选导入修复
+    - 问题：运行train_content.py时出现ModuleNotFoundError: No module named 'cycler'
+    - 解决：将matplotlib.pyplot导入改为可选导入（try-except），缺失时设为None
+    - 性质：依赖容错处理
+    - 说明：这4个训练文件都导入了matplotlib但实际上未使用，因此不影响训练流程
+
+13. tacm/download.py 和 diffusion/tacm_train_util.py - vqgan_ckpt参数验证和错误处理
+    - 问题：vqgan_ckpt为None或文件不存在时，出现AttributeError: 'NoneType' object has no attribute 'seek'
+    - 解决：添加参数验证（检查None和文件存在性）+ 异常处理（提供清晰的错误信息）
+    - 性质：参数验证和错误处理增强
+    - 说明：不改变模型加载逻辑，只是添加验证和更友好的错误提示
+
+14. diffusion/tacm_train_temp_util.py - BEATs音频特征提取CUDA/cuFFT错误修复（训练脚本）
+    - 问题：train_temp.py训练时，BEATs模型在GPU上提取音频特征时出现cuFFT错误
+    - 解决：将音频预处理移到CPU执行，完成后移回GPU（与修改#2相同的修复策略）
+    - 性质：运行时错误修复（不改变计算逻辑）
+    - 说明：仅改变计算设备，计算结果完全相同
+
+15. diffusion/tacm_train_util.py 和 scripts/train_content.py - 注释掉init_first_stage_from_ckpt方法和vqgan_ckpt参数
+    - 问题：根据作者说明，init_first_stage_from_ckpt方法和vqgan_ckpt参数在训练中不需要使用
+    - 解决：注释掉方法调用、方法定义和vqgan_ckpt参数（包括参数定义、赋值和命令行参数），保留原始代码以便将来恢复
+    - 性质：代码清理（根据作者建议）
+    - 说明：不改变训练逻辑，修改是可逆的
+
 ========================================
 二、修改特点总结
 ========================================
@@ -99,22 +123,28 @@ TIA2V 项目修改总结
 三、修改统计
 ========================================
 
-总修改数：11项
-涉及文件数：6个文件
+总修改数：15项
+涉及文件数：11个文件
   - diffusion/dist_util.py
+  - diffusion/tacm_train_util.py
+  - diffusion/tacm_train_temp_util.py
+  - diffusion/tacm_train_image_util.py
+  - diffusion/tacm_train_diffusion_util.py
   - scripts/sample_motion_optim.py
   - tacm/modules/__init__.py
   - tacm/data.py
   - tacm/utils.py
+  - tacm/download.py
   - optimization/video_editor.py
 
 修改类型分布：
-  - 环境兼容性修复：2项（#1, #2）
-  - 可选依赖处理：3项（#3, #4, #5）
+  - 环境兼容性修复：3项（#1, #2, #14）
+  - 可选依赖处理：4项（#3, #4, #5, #12）
   - 缺失工具函数补充：1项（#6）
   - 导入路径修正：2项（#7, #8）
-  - 文件/模型加载健壮性：2项（#9, #10）
+  - 文件/模型加载健壮性：3项（#9, #10, #13）
   - 性能优化：1项（#11）
+  - 代码清理：1项（#15）
 
 ========================================
 四、模型完整性评估

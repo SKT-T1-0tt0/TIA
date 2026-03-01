@@ -193,7 +193,7 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None, n_times_crossframe_attn_in_self=0,):
+    def forward(self, x, context=None, mask=None, n_times_crossframe_attn_in_self=0, return_attn=False, attn_cache=None):
         h = self.heads
 
         q = self.to_q(x)
@@ -227,8 +227,14 @@ class CrossAttention(nn.Module):
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
-        # attention, what we cannot get enough of
+        # attention, what we cannot get enough of (softmax 后、dropout 前)
         attn = sim.softmax(dim=-1)
+
+        if return_attn and attn_cache is not None:
+            # 只收 temporal cross-attention（query = 帧数 F），过滤掉 spatial text cross-attn (Nk=77)
+            if attn.shape[1] == 16:  # F=16，若未来可变则需动态传入
+                attn_cache.append(attn)
+                self.last_attn = attn  # [B*H, F, M] for temporal cross-attn
 
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
@@ -301,20 +307,43 @@ class BasicTemporalTransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
+        # 非 Tensor 参数不能进 checkpoint，否则 backward 里对 bool/list 调 detach() 会炸
+        self._return_attn = False
+        self._attn_cache = None
+        self._n_times_crossframe_attn_in_self = 0
+        # 层级自适应 attn2_scale（由 UNet forward 根据位置设置）
+        self.attn2_scale = 0.3  # 默认值，会被 UNet 覆盖
 
-    def forward(self, x, context=None, n_times_crossframe_attn_in_self=0):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+    def forward(self, x, context=None, n_times_crossframe_attn_in_self=0, return_attn=False, attn_cache=None):
+        self._return_attn = return_attn
+        self._attn_cache = attn_cache
+        self._n_times_crossframe_attn_in_self = n_times_crossframe_attn_in_self
+        return checkpoint(
+            self._forward,
+            (x, context),
+            self.parameters(),
+            self.checkpoint,
+        )
 
-    def _forward(self, x, context=None, n_times_crossframe_attn_in_self=0):
+    def _forward(self, x, context=None):
+        # self-attn：不动
         x = self.attn1(
-            self.norm1(x), 
+            self.norm1(x),
             context=context if self.disable_self_attn else None,
-            n_times_crossframe_attn_in_self=n_times_crossframe_attn_in_self if not self.disable_self_attn else 0,
+            n_times_crossframe_attn_in_self=self._n_times_crossframe_attn_in_self if not self.disable_self_attn else 0,
         ) + x
-        x = self.attn2(
-            self.norm2(x), 
-            context=context
-        ) + x
+        
+        # temporal cross-attn：单独 scale，抑制条件抖动放大
+        attn2_out = self.attn2(
+            self.norm2(x),
+            context=context,
+            return_attn=self._return_attn,
+            attn_cache=self._attn_cache,  # 只对 attn2 (temporal cross-attn) 收集
+        )
+        # attn2_scale 由 UNet 根据层级动态设置（Encoder=0.35, Bottleneck=0.45, Decoder=0.2/0.1）
+        x = x + self.attn2_scale * attn2_out
+        
+        # FFN：不动
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -411,7 +440,7 @@ class TemporalTransformer(nn.Module):
 
         self.use_linear = use_linear
 
-    def forward(self, x, context_temp=None):
+    def forward(self, x, context_temp=None, return_attn=False, attn_cache=None):
         # note: if no context is given, cross-attention defaults to self-attention
         bf, c, h, w = x.shape
         x_in = x
@@ -428,7 +457,7 @@ class TemporalTransformer(nn.Module):
         for i, block in enumerate(self.transformer_blocks):
             if i == 0:
                 context_temp = repeat(context_temp, "b m d -> (b r) m d", r=(h*w)//16)
-            x = block(x, context=context_temp, n_times_crossframe_attn_in_self=0)
+            x = block(x, context=context_temp, n_times_crossframe_attn_in_self=0, return_attn=return_attn, attn_cache=attn_cache)
 
         if self.use_linear:
             x = self.proj_out(x)
@@ -438,5 +467,5 @@ class TemporalTransformer(nn.Module):
             x = self.proj_out(x)
             x = rearrange(x, '(b h w) c f -> (b f) c h w', h=h, w=w).contiguous()
 
-        x = x + x_in
-        return x
+        # residual connection（attn2_scale 已在 block 内部精细控制，这里保持 1:1）
+        return x_in + x

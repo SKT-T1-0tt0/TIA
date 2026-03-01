@@ -11,24 +11,7 @@ import skvideo.io
 import sys
 import pdb as pdb_original
 
-try:
-    import ignite_trainer as it
-except ImportError:
-    # ignite_trainer is optional, only needed for training transforms
-    # Create a simple AbstractTransform base class for compatibility
-    import abc
-    import torch
-    from typing import Callable
-    
-    class AbstractTransform(abc.ABC, Callable[[torch.Tensor], torch.Tensor]):
-        @abc.abstractmethod
-        def __call__(self, x: torch.Tensor) -> torch.Tensor:
-            pass
-    
-    class _IgniteTrainerModule:
-        AbstractTransform = AbstractTransform
-    
-    it = _IgniteTrainerModule()
+import tacm.modules.ignite_trainer as it
 
 class ForkedPdb(pdb_original.Pdb):
     """A Pdb subclass that may be used
@@ -154,43 +137,6 @@ def save_video_grid(video, fname, nrow=None, fps=30):
     imageio.mimsave(fname, video, fps=fps)
     # skvideo.io.vwrite(fname, video_grid, inputdict={'-r': '5'})
     print('saved videos to', fname)
-
-
-def save_video(frames_list, path, fps=30):
-    """
-    Save a list of PIL Images as a video file.
-    frames_list: list of PIL Images
-    path: output video path
-    fps: frames per second
-    """
-    import imageio
-    imageio.mimsave(path, frames_list, fps=fps)
-
-
-class MetricsAccumulator:
-    """
-    Simple metrics accumulator for tracking and printing average metrics.
-    """
-    def __init__(self):
-        self.metrics = {}
-        self.counts = {}
-    
-    def update_metric(self, name, value):
-        """Update a metric with a new value."""
-        if name not in self.metrics:
-            self.metrics[name] = 0.0
-            self.counts[name] = 0
-        self.metrics[name] += value
-        self.counts[name] += 1
-    
-    def print_average_metric(self):
-        """Print the average value of all metrics."""
-        if not self.metrics:
-            return
-        for name in sorted(self.metrics.keys()):
-            avg = self.metrics[name] / self.counts[name]
-            print(f"{name}: {avg:.4f}", end="  ")
-        print()
 
 
 def comp_getattr(args, attr_name, default=None):

@@ -104,6 +104,8 @@ python scripts/train_temp.py --num_workers 8 --batch_size 1 --data_path datasets
 --lr 5e-5 --log_interval 50 --save_interval 5000 --gpus 1
 ```
 
+**MCFL 与 Online baseline 模仿**：若使用 MCFL（多模态条件融合）或后续接入 Online baseline 模仿，请参见 [MCFL_TRAINING_README.md](MCFL_TRAINING_README.md) 中的开关说明（`--use_mcfl`、`--mcfl_conservative`、`--use_baseline_imitation`）与示例命令。
+
 ## Acknowledgements
 Our code is based on [Latent-Diffusion](https://github.com/CompVis/latent-diffusion). Thanks to the authors for their significant contributions.
 

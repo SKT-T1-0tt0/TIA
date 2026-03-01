@@ -1,11 +1,6 @@
 from torch.nn import functional as F
 import torch
-
-try:
-    from tacm import AudioCLIP
-except ImportError:
-    # AudioCLIP is optional, only needed when audio_emb_model='audioclip'
-    AudioCLIP = None
+from tacm import AudioCLIP
 
 def d_clip_loss(x, y, use_cosine=False):
     x = F.normalize(x, dim=-1)

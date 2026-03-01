@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-26T22:43:16.738414",
+  "config": {
+    "real_dir": "results/1_tacm_/real",
+    "baseline_dir": "results/0_tacm_/fake1_30fps",
+    "mcfl_dir": "results/1_tacm_/fake1_30fps",
+    "use_bootstrap": true,
+    "bootstrap_k": 10
+  },
+  "results": {
+    "clip": {
+      "baseline": {
+        "mean": 0.28209228515625,
+        "std": 0.02002968507387739,
+        "value": "0.2821 ± 0.0200"
+      },
+      "mcfl": {
+        "mean": 0.275439453125,
+        "std": 0.014176479008127197,
+        "value": "0.2754 ± 0.0142"
+      }
+    }
+  }
+}

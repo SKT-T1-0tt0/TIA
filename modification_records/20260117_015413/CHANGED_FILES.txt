@@ -1,0 +1,21 @@
+修改文件列表
+================
+
+本次修改涉及以下文件：
+
+1. tacm/__init__.py
+   - 添加 AudioCLIP 导入
+
+2. diffusion/tacm_train_temp_util.py
+   - BEATs 模型移到 CPU（第 155 行）
+   - 音频处理时移到 CPU（第 250-253 行）
+
+3. scripts/sample_motion_optim.py
+   - 修复 VideoEditor 导入路径（第 31 行）
+   - 关闭 video_editor 功能（第 211-217 行）
+   - BEATs 模型移到 CPU（第 97 行）
+   - 音频处理时移到 CPU（第 146-148 行）
+
+4. optimization/video_editor.py
+   - 删除从 tacm.utils 的导入（第 5 行）
+   - 添加本地 save_video 和 MetricsAccumulator 定义（第 6-33 行）

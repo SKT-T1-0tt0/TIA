@@ -279,34 +279,51 @@ class DualTemporalTransformer(nn.Module):
     def forward(
         self,
         hidden_states,
-        encoder_hidden_states,
+        encoder_hidden_states=None,
+        context_temp=None,
+        return_attn=False,
+        attn_cache=None,
     ):
         """
         Args:
-            hidden_states ( When discrete, `torch.LongTensor` of shape `(batch size, num latent pixels)`.
-                When continuous, `torch.FloatTensor` of shape `(batch size, channel, height, width)`): Input
-                hidden_states.
-            encoder_hidden_states ( `torch.LongTensor` of shape `(batch size, encoder_hidden_states dim)`, *optional*):
-                Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
-                self-attention.
-            timestep ( `torch.long`, *optional*):
-                Optional timestep to be applied as an embedding in AdaLayerNorm's. Used to indicate denoising step.
-            attention_mask (`torch.FloatTensor`, *optional*):
-                Optional attention mask to be applied in Attention.
-
+            hidden_states: Input hidden_states.
+            encoder_hidden_states: Text condition [B, 77, D] (spatial c_ti).
+            context_temp: Temporal condition [B*T, 8, D] or [B*T, 85, D] (c_at).
+            return_attn: If True, temporal cross-attn stores last_attn (for baseline imitation).
         """
+        # 显式区分 text / temporal，避免 positional 传参串条件
+        # condition_lengths [8, 77] 期望 encoder_hidden_states = [audio_8, text_77]
+        if encoder_hidden_states is not None and context_temp is not None:
+            total_expected = sum(self.condition_lengths)  # 85
+            if context_temp.shape[1] < total_expected:
+                # MCFL: context_temp 仅 8 tokens，需拼接 text (77)
+                expansion = context_temp.shape[0] // encoder_hidden_states.shape[0]
+                text_expanded = repeat(
+                    encoder_hidden_states, "b n d -> (b f) n d", f=expansion
+                )
+                encoder_hidden_states = torch.cat(
+                    [context_temp, text_expanded], dim=1
+                )  # [B*T, 8+77, D]
+            else:
+                # Baseline: context_temp 已是 [8, 77]，直接用
+                encoder_hidden_states = context_temp
+        elif context_temp is not None:
+            encoder_hidden_states = context_temp
+        elif encoder_hidden_states is None:
+            raise ValueError("DualTemporalTransformer requires encoder_hidden_states and/or context_temp")
+
         input_states = hidden_states
 
         encoded_states = []
         tokens_start = 0
-        # attention_mask is not used yet
         for i in range(2):
-            # for each of the two transformers, pass the corresponding condition tokens
             condition_state = encoder_hidden_states[:, tokens_start : tokens_start + self.condition_lengths[i]]
             transformer_index = self.transformer_index_for_condition[i]
             encoded_state = self.transformers[transformer_index](
                 input_states,
                 context_temp=condition_state,
+                return_attn=return_attn,
+                attn_cache=attn_cache,
             )[0]
             encoded_states.append(encoded_state - input_states)
             tokens_start = tokens_start + self.condition_lengths[i]

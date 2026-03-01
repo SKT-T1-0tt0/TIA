@@ -40,8 +40,8 @@ def setup_dist():
         try:
             hostname = socket.gethostbyname(socket.getfqdn())
         except socket.gaierror:
-            # Fallback to localhost if hostname resolution fails
-            hostname = "localhost"
+            # 容器/无 DNS 环境下 getfqdn 可能无法解析，单机训练用 localhost 即可
+            hostname = "127.0.0.1"
     os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
     os.environ["RANK"] = str(comm.rank)
     os.environ["WORLD_SIZE"] = str(comm.size)

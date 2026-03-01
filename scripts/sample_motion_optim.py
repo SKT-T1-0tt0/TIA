@@ -2,9 +2,9 @@
 Generate a large batch of video samples from a model.
 """
 import sys
-
 sys.path.append('/data/workspace/TACM')
 import argparse
+import math
 import os
 import time
 import numpy as np
@@ -14,6 +14,7 @@ import torchvision.transforms.functional as F
 import torch.nn.functional as Func
 
 from diffusion import dist_util, logger
+from diffusion.condition_builder import build_conditions
 from diffusion.tacm_script_temp_util import (
     NUM_CLASSES,
     model_and_diffusion_defaults,
@@ -30,7 +31,7 @@ import wav2clip
 # from tacm import AudioCLIP
 from beats.BEATs import BEATs, BEATsConfig
 from optimization.video_editor import VideoEditor
-# from optimization.video_editor_simple import VideoEditor  # video_editor_simple.py 不存在，使用 video_editor.py
+# from optimization.video_editor_simple import VideoEditor  # 已改为使用 video_editor.py
 from optimization.arguments import get_arguments
 
 import soundfile
@@ -95,9 +96,28 @@ def main():
         checkpoint = th.load('saved_ckpts/BEATs_iter3_plus_AS20K.pt')
         cfg = BEATsConfig(checkpoint['cfg'])
         BEATs_model = BEATs(cfg)
-        BEATs_model = BEATs_model.to(dist_util.dev())
+        BEATs_model = BEATs_model.to('cpu')  # 固定在 CPU 上运行，避免 cuFFT 错误
         BEATs_model.load_state_dict(checkpoint['model'])
         BEATs_model.eval()
+    
+    # Initialize MCFL if enabled
+    mcfl = None
+    attn_pool_text = None
+    attn_pool_audio = None
+    mcfl_pooling_mode = getattr(args, 'mcfl_pooling_mode', 'mean')
+    
+    if args.use_mcfl:
+        from tacm import MCFL, AttnPool
+        mcfl = MCFL(
+            embed_dim=args.mcfl_embed_dim,
+            num_heads=8,
+            dropout=0.1  # Changed from 0.0 to 0.1 to prevent overfitting
+        ).to(dist_util.dev())
+        
+        # Initialize attention pooling modules if using attention pooling
+        if mcfl_pooling_mode == "attention":
+            attn_pool_text = AttnPool(dim=args.mcfl_embed_dim).to(dist_util.dev())
+            attn_pool_audio = AttnPool(dim=args.mcfl_embed_dim).to(dist_util.dev())
             
     # sampling
     for i in range(args.num_samples):
@@ -132,7 +152,7 @@ def main():
         if args.audio_emb_model == 'STFT':
             stft = batch['stft']
         else:
-            audio = batch['audio']  # Keep on CPU for preprocessing
+            audio = batch['audio'].to(dist_util.dev()) 
                
         # if args.audio_emb_model == 'audioclip':
         #     ((audio_embed, _, _), _), _ = audioclip_model(audio=audio)
@@ -144,15 +164,53 @@ def main():
             c_temp = stft
         elif args.audio_emb_model == 'beats':
             audio = rearrange(audio.unsqueeze(0), "b f g -> (b f) g")
-            # Extract features on CPU to avoid cuFFT error, then move result to GPU
-            with th.no_grad():
-                BEATs_model_cpu = BEATs_model.cpu()
-                c_temp = BEATs_model_cpu.extract_features(audio, padding_mask=None)[0] #torch.Size([16, 8, 768])
-                BEATs_model.to(dist_util.dev())  # Move model back to GPU
-            c_temp = c_temp.to(dist_util.dev())  # Move features to GPU
+            # 与训练一致：强度响应（tanh/compand）后再送 BEATs，提升跨分布泛化
+            resp = getattr(args, 'audio_response', 'tanh')
+            if resp == 'tanh':
+                audio = th.tanh(audio)
+            elif resp == 'compand':
+                mu = 5.0
+                audio = th.sign(audio) * th.log1p(mu * th.abs(audio)) / math.log1p(mu)
+            # 将音频移到 CPU 上进行处理，因为 BEATs 模型在 CPU 上
+            c_temp = BEATs_model.extract_features(audio.cpu(), padding_mask=None)[0] #torch.Size([16, 8, 768])
+            # 处理完成后移回 GPU
+            c_temp = c_temp.to(dist_util.dev())
+            # 与训练一致：对 c_temp 做跨帧 EMA 平滑，减轻 flicker
+            seq_len = c_temp.shape[0]
+            T = getattr(args, 'sequence_length', 16)
+            B = seq_len // T
+            if B >= 1 and seq_len == B * T:
+                c_temp_reshaped = c_temp.view(B, T, c_temp.shape[1], c_temp.shape[2])
+                alpha = 0.9
+                c_smoothed = c_temp_reshaped.clone()
+                for t in range(1, T):
+                    c_smoothed[:, t] = alpha * c_smoothed[:, t - 1] + (1 - alpha) * c_temp_reshaped[:, t]
+                c_temp = c_smoothed.view(seq_len, c_temp.shape[1], c_temp.shape[2])
         
-        c_t = repeat(c_t, "b n d -> (b f) n d", f=c_temp.shape[0])
-        c_at = th.concat((c_temp, c_t), 1)
+        # Use common condition builder (shared with training)
+        # MCFL v2-A: Temporal-only + Gated Residual
+        c_ti, c_at = build_conditions(
+            c_t=c_t,
+            image_cat=image_cat,
+            c_temp=c_temp,
+            mcfl=mcfl,
+            use_mcfl=args.use_mcfl,
+            pooling_mode=mcfl_pooling_mode,
+            attn_pool_text=attn_pool_text,
+            attn_pool_audio=attn_pool_audio,
+            mcfl_gate_lambda=getattr(args, 'mcfl_gate_lambda', 0.2),
+            mcfl_norm_modality=getattr(args, 'mcfl_norm_modality', True),
+            mcfl_gate_adaptive=getattr(args, 'mcfl_gate_adaptive', True),
+            mcfl_gate_norm_low=getattr(args, 'mcfl_gate_norm_low', 7.2),
+            mcfl_gate_norm_high=getattr(args, 'mcfl_gate_norm_high', 10.0),
+            mcfl_gate_time_smooth=getattr(args, 'mcfl_gate_time_smooth', True),
+            mcfl_gate_ema=getattr(args, 'mcfl_gate_ema', 0.9),
+            mcfl_gate_use_zscore=getattr(args, 'mcfl_gate_use_zscore', False),
+            mcfl_gate_norm_mu=getattr(args, 'mcfl_gate_norm_mu', 8.4),
+            mcfl_gate_norm_sigma=getattr(args, 'mcfl_gate_norm_sigma', 0.5),
+            mcfl_gate_z_low=getattr(args, 'mcfl_gate_z_low', -1.5),
+            mcfl_gate_z_high=getattr(args, 'mcfl_gate_z_high', 1.5),
+        )
         c_at = c_at.to(dist_util.dev())
         #c_temp = c_temp.to(dist_util.dev()) 
 
@@ -211,7 +269,7 @@ def main():
         soundfile.write(os.path.join('./results/%d_tacm_%s/audio/'%(args.run, args.dataset), 'groundtruth_%d.wav'%(i)), batch['audio'].reshape(-1).numpy(), 96000)
 
 
-        #video editing - DISABLED to save time
+        #video editing - 暂时关闭
         # video = sample_recon.squeeze()
         # video = Func.interpolate(video, size=(128, 128), mode='bilinear',align_corners=False)
         # logger.log("creating video editor...")
@@ -247,6 +305,22 @@ def create_argparser():
         vqgan_ckpt="",
         run=0,
         dataset="",
+        use_mcfl=False,  # MCFL flag: enable multi-modal condition fusion
+        mcfl_embed_dim=768,  # MCFL embedding dimension (must match condition dimension)
+        mcfl_pooling_mode="mean",  # Pooling mode: "mean" (average) or "attention" (learned attention weights)
+        mcfl_gate_lambda=0.2,
+        mcfl_norm_modality=True,
+        mcfl_gate_adaptive=True,
+        mcfl_gate_norm_low=7.2,
+        mcfl_gate_norm_high=10.0,
+        mcfl_gate_time_smooth=True,
+        mcfl_gate_ema=0.9,
+        mcfl_gate_use_zscore=False,
+        mcfl_gate_norm_mu=8.4,
+        mcfl_gate_norm_sigma=0.5,
+        mcfl_gate_z_low=-1.5,
+        mcfl_gate_z_high=1.5,
+        audio_response='tanh',
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

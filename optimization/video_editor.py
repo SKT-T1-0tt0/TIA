@@ -2,7 +2,35 @@ import os
 from pathlib import Path
 from optimization.constants import ASSETS_DIR_NAME, RANKED_RESULTS_DIR
 
-from tacm.utils import MetricsAccumulator,save_video
+# save_video 和 MetricsAccumulator 本地定义（不依赖 tacm.utils）
+def save_video(frames_list, path, fps=30):
+    """
+    Save a list of frames (tensor or PIL Images) as a video file.
+    frames_list: tensor of shape (t, c, h, w) or list of PIL Images
+    path: output video path
+    fps: frames per second
+    """
+    import imageio
+    if isinstance(frames_list, torch.Tensor):
+        # Convert tensor to numpy array
+        frames_list = frames_list.permute(0, 2, 3, 1)  # (t, h, w, c)
+        frames_list = (frames_list.cpu().numpy() * 255).astype('uint8')
+        frames_list = [frames_list[i] for i in range(frames_list.shape[0])]
+    imageio.mimsave(path, frames_list, fps=fps)
+
+# MetricsAccumulator 占位符定义
+class MetricsAccumulator:
+    def __init__(self):
+        self.metrics = {}
+        self.counts = {}
+    def update(self, metrics_dict):
+        pass
+    def get_average(self, key):
+        return 0.0
+    def get_all_averages(self):
+        return {}
+    def reset(self):
+        pass
 
 from numpy import random
 from optimization.augmentations import ImageAugmentations
@@ -27,11 +55,7 @@ from diffusion.tacm_script_util import (
 
 from diffusion import logger
 
-try:
-    from tacm import AudioCLIP
-except ImportError:
-    # AudioCLIP is optional, only needed when audio_emb_model='audioclip'
-    AudioCLIP = None
+from tacm import AudioCLIP
 #from utils.transforms import ToTensor1D
 
 
@@ -77,15 +101,7 @@ class VideoEditor:
         print("Using device:", self.device)
 
         self.model, self.diffusion = create_model_and_diffusion(**self.model_config)
-        # Check if diffusion_ckpt file exists, if not, try to use model_path from args
-        if os.path.exists(self.args.diffusion_ckpt):
-            self.model.load_state_dict(torch.load(self.args.diffusion_ckpt, map_location="cpu"))
-        elif hasattr(self.args, 'model_path') and self.args.model_path and os.path.exists(self.args.model_path):
-            # Fallback to model_path if diffusion_ckpt doesn't exist
-            logger.log(f"diffusion_ckpt not found, using model_path instead: {self.args.model_path}")
-            self.model.load_state_dict(torch.load(self.args.model_path, map_location="cpu"))
-        else:
-            logger.log(f"Warning: Neither diffusion_ckpt ({self.args.diffusion_ckpt}) nor model_path found. Model will not be loaded.")
+        self.model.load_state_dict(torch.load(self.args.diffusion_ckpt,map_location="cpu",))
         self.model.requires_grad_(False).eval().to(self.device)
         for name, param in self.model.named_parameters():
             if "qkv" in name or "norm" in name or "proj" in name:
@@ -100,29 +116,17 @@ class VideoEditor:
         self.clip_normalize = transforms.Normalize(
             mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
         
-        # Only load wav2clip_model if needed (for wav2clip or beats audio embedding)
-        # Use lazy loading to avoid download errors if not needed
-        self.wav2clip_model = None
-        if hasattr(self.args, 'audio_emb_model') and self.args.audio_emb_model in ['wav2clip', 'beats']:
-            try:
-                self.wav2clip_model = wav2clip.get_model()
-                self.wav2clip_model = self.wav2clip_model.to(self.device)
-                for p in self.wav2clip_model.parameters():
-                    p.requires_grad = False
-            except Exception as e:
-                logger.log(f"Warning: Failed to load wav2clip model: {e}. wav2clip features will not be available.")
-                self.wav2clip_model = None
+        self.wav2clip_model = wav2clip.get_model()
+        self.wav2clip_model = self.wav2clip_model.to(self.device)
+        for p in self.wav2clip_model.parameters():
+            p.requires_grad = False
             
         self.lpips_model = lpips.LPIPS(net="vgg").to(self.device)
 
         self.image_augmentations = ImageAugmentations(self.clip_size, self.args.aug_num)
         self.metrics_accumulator = MetricsAccumulator()
         
-        # Only initialize AudioCLIP if it's available and needed
-        if AudioCLIP is not None and hasattr(self.args, 'audio_emb_model') and self.args.audio_emb_model == 'audioclip':
-            self.audioclip = AudioCLIP(pretrained=f'saved_ckpts/AudioCLIP-Full-Training.pt')
-        else:
-            self.audioclip = None
+        self.audioclip = AudioCLIP(pretrained=f'saved_ckpts/AudioCLIP-Full-Training.pt')
 
     def unscale_timestep(self, t):
         unscaled_timestep = (t * (self.diffusion.num_timesteps / 1000)).long()
@@ -263,8 +267,6 @@ class VideoEditor:
         #text_embed = self.clip_model.encode_text(clip.tokenize(self.args.prompt).to(self.device)).float()
         if audio is not None:
             if self.args.audio_emb_model in ['wav2clip', 'beats']:
-                if self.wav2clip_model is None:
-                    raise RuntimeError(f"wav2clip model is not available but required for audio_emb_model='{self.args.audio_emb_model}'")
                 audio_embed = torch.from_numpy(wav2clip.embed_audio(audio.cpu().numpy().squeeze(), self.wav2clip_model)).cuda() #(16,512)
             elif self.args.audio_emb_model == 'audioclip':
                 ((audio_embed, _, _), _), _ = self.audioclip(audio=audio)

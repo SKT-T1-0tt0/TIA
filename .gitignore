@@ -35,3 +35,10 @@ miniconda3/
 .cache/
 *.log
 tacm/modules/cache/
+
+# ======================
+# Eval caches (optional, remove if you want to track)
+# ======================
+ffc_cache/
+fid_cache/
+fvd_cache/
