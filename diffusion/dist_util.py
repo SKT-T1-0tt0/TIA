@@ -37,11 +37,7 @@ def setup_dist():
     if backend == "gloo":
         hostname = "localhost"
     else:
-        try:
-            hostname = socket.gethostbyname(socket.getfqdn())
-        except socket.gaierror:
-            # 容器/无 DNS 环境下 getfqdn 可能无法解析，单机训练用 localhost 即可
-            hostname = "127.0.0.1"
+        hostname = socket.gethostbyname(socket.getfqdn())
     os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
     os.environ["RANK"] = str(comm.rank)
     os.environ["WORLD_SIZE"] = str(comm.size)

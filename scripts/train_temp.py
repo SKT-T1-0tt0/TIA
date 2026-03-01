@@ -89,22 +89,6 @@ def main():
         lambda_temp=getattr(args, 'lambda_temp', 0.0),  # Temporal smooth regularization weight (default 0.0 = disabled)
         mcfl_conservative=getattr(args, 'mcfl_conservative', True),  # True = current MCFL curriculum; False = full MCFL (for baseline imitation)
         use_baseline_imitation=getattr(args, 'use_baseline_imitation', False),  # Online baseline imitation (implement when needed)
-        mcfl_norm_modality=getattr(args, 'mcfl_norm_modality', True),
-        audio_response=getattr(args, 'audio_response', 'tanh'),
-        audio_random_gain=getattr(args, 'audio_random_gain', True),
-        audio_gain_range=(getattr(args, 'audio_gain_low', 0.25), getattr(args, 'audio_gain_high', 4.0)),
-        audio_random_response_strength=getattr(args, 'audio_random_response_strength', True),
-        modality_dropout_prob=getattr(args, 'modality_dropout_prob', 0.2),
-        mcfl_gate_adaptive=getattr(args, 'mcfl_gate_adaptive', True),
-        mcfl_gate_norm_low=getattr(args, 'mcfl_gate_norm_low', 7.2),
-        mcfl_gate_norm_high=getattr(args, 'mcfl_gate_norm_high', 10.0),
-        mcfl_gate_time_smooth=getattr(args, 'mcfl_gate_time_smooth', True),
-        mcfl_gate_ema=getattr(args, 'mcfl_gate_ema', 0.9),
-        mcfl_gate_use_zscore=getattr(args, 'mcfl_gate_use_zscore', False),
-        mcfl_gate_norm_mu=getattr(args, 'mcfl_gate_norm_mu', 8.4),
-        mcfl_gate_norm_sigma=getattr(args, 'mcfl_gate_norm_sigma', 0.5),
-        mcfl_gate_z_low=getattr(args, 'mcfl_gate_z_low', -1.5),
-        mcfl_gate_z_high=getattr(args, 'mcfl_gate_z_high', 1.5),
     ).run_loop()
 
 
@@ -132,23 +116,6 @@ def create_argparser():
         lambda_temp=0.0,
         mcfl_conservative=True,  # True = alpha + freeze + lambda_temp curriculum (current MCFL); False = full MCFL for baseline imitation
         use_baseline_imitation=False,  # Online baseline output imitation (placeholder; implement when needed)
-        mcfl_norm_modality=True,
-        audio_response='tanh',
-        audio_random_gain=True,
-        audio_gain_low=0.25,
-        audio_gain_high=4.0,
-        audio_random_response_strength=True,
-        modality_dropout_prob=0.2,
-        mcfl_gate_adaptive=True,
-        mcfl_gate_norm_low=7.2,
-        mcfl_gate_norm_high=10.0,
-        mcfl_gate_time_smooth=True,
-        mcfl_gate_ema=0.9,
-        mcfl_gate_use_zscore=False,
-        mcfl_gate_norm_mu=8.4,
-        mcfl_gate_norm_sigma=0.5,
-        mcfl_gate_z_low=-1.5,
-        mcfl_gate_z_high=1.5,
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

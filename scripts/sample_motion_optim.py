@@ -4,7 +4,6 @@ Generate a large batch of video samples from a model.
 import sys
 sys.path.append('/data/workspace/TACM')
 import argparse
-import math
 import os
 import time
 import numpy as np
@@ -164,28 +163,10 @@ def main():
             c_temp = stft
         elif args.audio_emb_model == 'beats':
             audio = rearrange(audio.unsqueeze(0), "b f g -> (b f) g")
-            # 与训练一致：强度响应（tanh/compand）后再送 BEATs，提升跨分布泛化
-            resp = getattr(args, 'audio_response', 'tanh')
-            if resp == 'tanh':
-                audio = th.tanh(audio)
-            elif resp == 'compand':
-                mu = 5.0
-                audio = th.sign(audio) * th.log1p(mu * th.abs(audio)) / math.log1p(mu)
             # 将音频移到 CPU 上进行处理，因为 BEATs 模型在 CPU 上
             c_temp = BEATs_model.extract_features(audio.cpu(), padding_mask=None)[0] #torch.Size([16, 8, 768])
             # 处理完成后移回 GPU
             c_temp = c_temp.to(dist_util.dev())
-            # 与训练一致：对 c_temp 做跨帧 EMA 平滑，减轻 flicker
-            seq_len = c_temp.shape[0]
-            T = getattr(args, 'sequence_length', 16)
-            B = seq_len // T
-            if B >= 1 and seq_len == B * T:
-                c_temp_reshaped = c_temp.view(B, T, c_temp.shape[1], c_temp.shape[2])
-                alpha = 0.9
-                c_smoothed = c_temp_reshaped.clone()
-                for t in range(1, T):
-                    c_smoothed[:, t] = alpha * c_smoothed[:, t - 1] + (1 - alpha) * c_temp_reshaped[:, t]
-                c_temp = c_smoothed.view(seq_len, c_temp.shape[1], c_temp.shape[2])
         
         # Use common condition builder (shared with training)
         # MCFL v2-A: Temporal-only + Gated Residual
@@ -198,18 +179,7 @@ def main():
             pooling_mode=mcfl_pooling_mode,
             attn_pool_text=attn_pool_text,
             attn_pool_audio=attn_pool_audio,
-            mcfl_gate_lambda=getattr(args, 'mcfl_gate_lambda', 0.2),
-            mcfl_norm_modality=getattr(args, 'mcfl_norm_modality', True),
-            mcfl_gate_adaptive=getattr(args, 'mcfl_gate_adaptive', True),
-            mcfl_gate_norm_low=getattr(args, 'mcfl_gate_norm_low', 7.2),
-            mcfl_gate_norm_high=getattr(args, 'mcfl_gate_norm_high', 10.0),
-            mcfl_gate_time_smooth=getattr(args, 'mcfl_gate_time_smooth', True),
-            mcfl_gate_ema=getattr(args, 'mcfl_gate_ema', 0.9),
-            mcfl_gate_use_zscore=getattr(args, 'mcfl_gate_use_zscore', False),
-            mcfl_gate_norm_mu=getattr(args, 'mcfl_gate_norm_mu', 8.4),
-            mcfl_gate_norm_sigma=getattr(args, 'mcfl_gate_norm_sigma', 0.5),
-            mcfl_gate_z_low=getattr(args, 'mcfl_gate_z_low', -1.5),
-            mcfl_gate_z_high=getattr(args, 'mcfl_gate_z_high', 1.5),
+            mcfl_gate_lambda=getattr(args, 'mcfl_gate_lambda', 0.2),  # Default 0.2 for v2-A
         )
         c_at = c_at.to(dist_util.dev())
         #c_temp = c_temp.to(dist_util.dev()) 
@@ -308,19 +278,7 @@ def create_argparser():
         use_mcfl=False,  # MCFL flag: enable multi-modal condition fusion
         mcfl_embed_dim=768,  # MCFL embedding dimension (must match condition dimension)
         mcfl_pooling_mode="mean",  # Pooling mode: "mean" (average) or "attention" (learned attention weights)
-        mcfl_gate_lambda=0.2,
-        mcfl_norm_modality=True,
-        mcfl_gate_adaptive=True,
-        mcfl_gate_norm_low=7.2,
-        mcfl_gate_norm_high=10.0,
-        mcfl_gate_time_smooth=True,
-        mcfl_gate_ema=0.9,
-        mcfl_gate_use_zscore=False,
-        mcfl_gate_norm_mu=8.4,
-        mcfl_gate_norm_sigma=0.5,
-        mcfl_gate_z_low=-1.5,
-        mcfl_gate_z_high=1.5,
-        audio_response='tanh',
+        mcfl_gate_lambda=0.2,  # MCFL v2-A gate parameter for gated residual (default 0.2, range [0, 1])
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

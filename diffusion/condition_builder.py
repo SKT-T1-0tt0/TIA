@@ -20,17 +20,6 @@ def build_conditions(
     attn_pool_text=None,  # Optional AttnPool for text (if pooling_mode="attention")
     attn_pool_audio=None,  # Optional AttnPool for audio (if pooling_mode="attention")
     mcfl_gate_lambda: float = 0.1,  # Gate parameter for MCFL v2-A (0.1 降低 TC_FLICKER，原 0.2)
-    mcfl_norm_modality: bool = True,  # 跨分布鲁棒：送入 MCFL 前对 image/audio 做 L2 归一化，减弱幅值差异
-    mcfl_gate_adaptive: bool = True,  # 异常输入时 gate→0：用音频 embedding 范数做置信度
-    mcfl_gate_norm_low: float = 7.2,  # 置信度三角形下界（统一标定：覆盖 drums/URMP/landscape p5）
-    mcfl_gate_norm_high: float = 10.0,  # 置信度三角形上界（统一标定：覆盖三数据集 p95）
-    mcfl_gate_time_smooth: bool = True,  # 对 gate 做时间 EMA，减轻 flicker
-    mcfl_gate_ema: float = 0.9,  # gate_t = ema*gate_{t-1} + (1-ema)*gate_raw_t，0.9 更强平滑
-    mcfl_gate_use_zscore: bool = False,  # True: 用 z=(norm-mu)/sigma 标定，跨数据集更稳
-    mcfl_gate_norm_mu: float = 8.4,  # z-score 均值（来自训练/多数据集统计）
-    mcfl_gate_norm_sigma: float = 0.5,  # z-score 标准差
-    mcfl_gate_z_low: float = -1.5,  # z 下界，conf 线性映射
-    mcfl_gate_z_high: float = 1.5,  # z 上界
 ) -> Tuple[th.Tensor, th.Tensor]:
     """
     Build conditions for diffusion model with optional MCFL fusion.
@@ -101,67 +90,39 @@ def build_conditions(
             else:
                 c_audio_single = c_temp.mean(dim=1)  # [B, D] - audio sequence average
         
-        # 置信度自适应 gate：异常输入时 gate→0（在 L2 norm 前用原始范数）
-        def _conf_from_norm(norm_1d):
-            if mcfl_gate_use_zscore:
-                z = (norm_1d - mcfl_gate_norm_mu) / (mcfl_gate_norm_sigma + 1e-6)
-                return th.clamp(
-                    (z - mcfl_gate_z_low) / (mcfl_gate_z_high - mcfl_gate_z_low + 1e-6), 0.0, 1.0
-                )
-            t_low, t_high = mcfl_gate_norm_low, mcfl_gate_norm_high
-            t_mid = (t_low + t_high) * 0.5
-            span = (t_high - t_low) + 1e-8
-            return th.clamp(1.0 - 2.0 * th.abs(norm_1d - t_mid) / span, 0.0, 1.0)
-        
-        if mcfl_gate_adaptive and expansion_factor > 1 and mcfl_gate_time_smooth:
-            # 每帧 gate + 时间 EMA 平滑，减轻 flicker
-            c_audio_per_frame = c_temp.mean(dim=1)  # [B*T, D]
-            raw_norm_frame = c_audio_per_frame.norm(dim=-1)  # [B*T]
-            conf_frame = _conf_from_norm(raw_norm_frame)  # [B*T]
-            conf_2d = conf_frame.view(B_orig, expansion_factor)  # [B, T]
-            conf_smooth = conf_2d.clone()
-            for t in range(1, expansion_factor):
-                conf_smooth[:, t] = mcfl_gate_ema * conf_smooth[:, t - 1] + (1.0 - mcfl_gate_ema) * conf_2d[:, t]
-            gate_per_frame = (mcfl_gate_lambda * conf_smooth.view(-1)).unsqueeze(1)  # [B*T, 1]
-        elif mcfl_gate_adaptive:
-            raw_norm_single = c_audio_single.norm(dim=-1)  # [B]
-            conf = _conf_from_norm(raw_norm_single).unsqueeze(1)  # [B, 1]
-            gate_per_frame = mcfl_gate_lambda * conf  # [B, 1]，后面 expand 到 [B*T, 1]
-        else:
-            gate_per_frame = None  # 用固定 lam
-        
-        # 跨分布鲁棒：对 image/audio 做 L2 归一化，使 MCFL 更依赖方向而非幅值
-        if mcfl_norm_modality:
-            c_image_single = c_image_single / (c_image_single.norm(dim=-1, keepdim=True) + 1e-6)
-            c_audio_single = c_audio_single / (c_audio_single.norm(dim=-1, keepdim=True) + 1e-6)
-        
         # MCFL v2-A: Gated Residual
+        # Core formula: c_fused = c_text + λ * (MCFL(...) - c_text)
+        # This makes fused condition an "increment" rather than full replacement
+        
+        # 🔪 第二刀：对 MCFL 梯度做"半截断"（image/audio detach，text 保留梯度）
         c_hat = mcfl(
             c_text_single,
             c_image_single.detach(),
             c_audio_single.detach()
         )  # [B, D] - MCFL output
         
+        # 🔪 第一刀：对 delta 做 norm + scale（保留方向，抹掉幅值不稳定性）
         delta = c_hat - c_text_single  # [B, D]
-        delta_norm = delta.norm(dim=-1, keepdim=True) + 1e-6
-        delta = delta / delta_norm
-        delta_scale = 0.2
+        delta_norm = delta.norm(dim=-1, keepdim=True) + 1e-6  # [B, 1]
+        delta = delta / delta_norm  # 归一化方向
+        delta_scale = 0.2  # 固定幅度（可调：0.1 ~ 0.3）
         delta = delta * delta_scale  # [B, D]
         
-        if gate_per_frame is not None:
-            if gate_per_frame.dim() == 2 and gate_per_frame.shape[0] == B_orig and gate_per_frame.shape[1] == 1:
-                # per-sample gate，expand 到 [B*T, 1]
-                gate_expanded = repeat(gate_per_frame, "b 1 -> (b f) 1", f=expansion_factor)
-            else:
-                gate_expanded = gate_per_frame  # 已是 [B*T, 1]
-            c_fused_expanded = repeat(c_text_single, "b d -> (b f) d", f=expansion_factor) + gate_expanded * repeat(delta, "b d -> (b f) d", f=expansion_factor)
-        else:
-            lam = mcfl_gate_lambda
-            c_fused = c_text_single + lam * delta  # [B, D]
-            c_fused_expanded = repeat(c_fused, "b d -> (b f) d", f=expansion_factor)
+        lam = mcfl_gate_lambda  # Gate parameter (now 0.1, was 0.2)
+        c_fused = c_text_single + lam * delta  # [B, D] - Gated residual
         
-        # Expand to sequence format [B*T, T_seq, D]
+        # MCFL v2-A: Temporal-only injection
+        # c_ti remains baseline (already set above) - protects spatial quality
+        # Only c_at uses fused condition for temporal/AV alignment
+        
+        # For c_at: expand fused condition to match c_temp's batch dimension [B*T, ...]
+        c_fused_expanded = repeat(c_fused, "b d -> (b f) d", f=expansion_factor)  # [B*T, D]
+        
+        # Expand fused to sequence format: [B*T, T_seq, D]
+        # Match the sequence length of c_temp for concatenation
         c_fused_expanded_seq = c_fused_expanded.unsqueeze(1).repeat(1, c_temp.shape[1], 1)  # [B*T, T_seq, D]
+        
+        # Temporal condition: concat audio + fused (replaces original text expansion)
         c_at = th.concat((c_temp, c_fused_expanded_seq), dim=1)  # [B*T, T_seq+T_seq, D]
     else:
         # Original logic (baseline): expand c_t to match c_temp's batch dimension for c_at

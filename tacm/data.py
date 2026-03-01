@@ -31,28 +31,6 @@ from tacm.modules import AudioCLIP
 from torch.utils.data import default_collate
 
 
-def normalize_and_clip_audio(audio, norm_mode="peak", soft_clip="none", rms_target=0.1):
-    """
-    音频幅度归一化 + 可选 soft clipping，提升跨分布（如 drums/landscape/URMP）泛化。
-    norm_mode: "none" | "peak" | "rms"
-    soft_clip: "none" | "tanh" | "compand"（压缩动态范围，减弱极端幅度对 BEATs 的影响）
-    """
-    audio = np.asarray(audio, dtype=np.float64)
-    if norm_mode == "peak":
-        peak = np.abs(audio).max()
-        if peak > 1e-8:
-            audio = audio / peak
-    elif norm_mode == "rms":
-        rms = np.sqrt(np.mean(audio ** 2)) + 1e-8
-        audio = audio * (rms_target / rms)
-    if soft_clip == "tanh":
-        audio = np.tanh(audio)
-    elif soft_clip == "compand":
-        mu = 5.0
-        audio = np.sign(audio) * np.log1p(mu * np.abs(audio)) / np.log1p(mu)
-    return audio.astype(np.float32)
-
-
 def collate_fn(batch):
     # 过滤掉 batch 中的 None
     batch = [x for x in batch if x is not None]
@@ -79,15 +57,10 @@ class VideoData(pl.LightningDataModule):
     def _dataset(self, train):
         if hasattr(self.args, 'text_stft_cond') and self.args.text_stft_cond:
             Dataset = TAVDataset
-            dataset = Dataset(
-                self.args.data_path, self.args.sequence_length, self.args.text_emb_model,
-                self.args.audio_emb_model, train=train, resolution=self.args.resolution,
-                load_vid_len=self.args.load_vid_len, image_channels=self.args.image_channels,
-                text_len=self.args.text_seq_len, truncate_captions=self.args.truncate_captions,
-                audio_norm_mode=getattr(self.args, 'audio_norm_mode', 'peak'),
-                audio_soft_clip=getattr(self.args, 'audio_soft_clip', 'none'),
-                audio_rms_target=getattr(self.args, 'audio_rms_target', 0.1),
-            )
+            dataset = Dataset(self.args.data_path, self.args.sequence_length, self.args.text_emb_model,
+                              self.args.audio_emb_model, train=train, resolution=self.args.resolution,
+                              load_vid_len=self.args.load_vid_len, image_channels=self.args.image_channels,
+                              text_len=self.args.text_seq_len, truncate_captions=self.args.truncate_captions)
         elif hasattr(self.args, 'image_folder') and self.args.image_folder:
             Dataset = FrameDataset
             dataset = Dataset(self.args.data_path, self.args.sequence_length, resolution=self.args.resolution, sample_every_n_frames=self.args.sample_every_n_frames)
@@ -164,12 +137,7 @@ class VideoData(pl.LightningDataModule):
         parser.add_argument('--text_seq_len', type=int, default=64)
         parser.add_argument('--truncate_captions', type=str, default=False)
         parser.add_argument('--load_vid_len', type=int, default=30)
-        # 音频幅度归一化 / soft clipping，提升跨分布泛化（FVD/FID 在 post_audioset_drums 等）
-        parser.add_argument('--audio_norm_mode', type=str, default='peak', choices=['none', 'peak', 'rms'],
-                            help='Audio amplitude norm: none / peak / rms')
-        parser.add_argument('--audio_soft_clip', type=str, default='none', choices=['none', 'tanh', 'compand'],
-                            help='Soft clipping: none（推荐，避免与 BEATs 前 response 压两次）/ tanh / compand')
-        parser.add_argument('--audio_rms_target', type=float, default=0.1, help='Target RMS when audio_norm_mode=rms')
+
 
         return parser
 
@@ -550,15 +518,15 @@ class TAVDataset(data.Dataset):
     Returns BCTHW videos in the range [-0.5, 0.5] """
     
 
-    def __init__(self, data_folder, sequence_length, text_emb_model, audio_emb_model,
+    def __init__(self, data_folder, sequence_length, text_emb_model, audio_emb_model, 
                  train=True, resolution=96, sample_every_n_frames=1, load_vid_len=30,
-                 image_channels=3, text_len=96, truncate_captions=False,
-                 audio_norm_mode="peak", audio_soft_clip="none", audio_rms_target=0.1):
+                 image_channels=3, text_len=96, truncate_captions=False):
         """
         Args:
-            audio_norm_mode: "none" | "peak" | "rms" — 幅度归一化，提升跨分布泛化
-            audio_soft_clip: "none" | "tanh" | "compand" — 软削波，减弱极端幅度
-            audio_rms_target: rms 归一化时的目标 RMS（仅当 audio_norm_mode=="rms" 时有效）
+            data_folder: path to the folder with videos. The folder
+                should contain a 'train' and a 'test' directory,
+                each with corresponding videos stored
+            sequence_length: length of extracted video sequences
         """
         super().__init__()
         self.train = train
@@ -570,9 +538,6 @@ class TAVDataset(data.Dataset):
         self.audio_emb_model = audio_emb_model
         self.text_len = text_len
         self.truncate_captions = truncate_captions
-        self.audio_norm_mode = audio_norm_mode
-        self.audio_soft_clip = audio_soft_clip
-        self.audio_rms_target = audio_rms_target
 
         folder = osp.join(data_folder, 'train' if train else 'test')
         self.stft_paths = sum([glob.glob(osp.join(folder,'**', f'*.pickle'), recursive=True)], [])
@@ -665,15 +630,7 @@ class TAVDataset(data.Dataset):
             audio, _ = librosa.load(audiofile, sr=sr)
             audio = audio.reshape(self.load_vid_len, -1)
             audio = audio[start:end, :]
-            # 幅度归一化 + soft clipping，提升跨分布泛化（如 post_audioset_drums）
-            if getattr(self, 'audio_norm_mode', 'none') != 'none' or getattr(self, 'audio_soft_clip', 'none') != 'none':
-                audio = normalize_and_clip_audio(
-                    audio,
-                    norm_mode=getattr(self, 'audio_norm_mode', 'peak'),
-                    soft_clip=getattr(self, 'audio_soft_clip', 'tanh'),
-                    rms_target=getattr(self, 'audio_rms_target', 0.1),
-                )
-            return dict(**preprocess(video[start:end], self.resolution, sample_every_n_frames=self.sample_every_n_frames),
+            return dict(**preprocess(video[start:end], self.resolution, sample_every_n_frames=self.sample_every_n_frames), 
                         text=outputs, raw_text=text, audio=torch.tensor(audio), path=self.video_paths[video_idx])
         
         
