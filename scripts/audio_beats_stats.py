@@ -83,8 +83,9 @@ def collect_audio_stats(wav_paths, sr, load_vid_len, max_files=None):
     }
 
 
-def collect_beats_norms(wav_paths, sr, load_vid_len, sequence_length, max_files, max_clips_per_file, beats_ckpt, device="cpu"):
-    """用 BEATs 跑与训练一致的 16 段 clip，统计 embedding 范数（每帧、pooled）。"""
+def collect_beats_norms(wav_paths, sr, load_vid_len, sequence_length, max_files, max_clips_per_file, beats_ckpt, device="cpu",
+                       gate_norm_low=7.2, gate_norm_high=10.0, gate_use_zscore=False, gate_norm_mu=8.4, gate_norm_sigma=0.5):
+    """用 BEATs 跑与训练一致的 16 段 clip，统计 embedding 范数（每帧、pooled）及 conf 分布（护栏2）。"""
     import torch as th
     from einops import rearrange
     from beats.BEATs import BEATs, BEATsConfig
@@ -140,6 +141,17 @@ def collect_beats_norms(wav_paths, sr, load_vid_len, sequence_length, max_files,
     per_frame_norms = np.array(per_frame_norms)
     pooled_norms = np.array(pooled_norms)
 
+    # 护栏2：conf 分布（与 condition_builder 一致的三角形或 z-score），便于 eval 时对比
+    def _conf_from_norm(n, low, high, use_zscore=False, mu=8.4, sigma=0.5, z_low=-1.5, z_high=1.5):
+        if use_zscore:
+            z = (n - mu) / (sigma + 1e-6)
+            return np.clip((z - z_low) / (z_high - z_low + 1e-6), 0.0, 1.0)
+        mid = (low + high) * 0.5
+        span = (high - low) + 1e-8
+        return np.clip(1.0 - 2.0 * np.abs(n - mid) / span, 0.0, 1.0)
+
+    confs = _conf_from_norm(pooled_norms, gate_norm_low, gate_norm_high, use_zscore=gate_use_zscore, mu=gate_norm_mu, sigma=gate_norm_sigma)
+
     return {
         "n_clips": len(pooled_norms),
         "n_frame_embeddings": len(per_frame_norms),
@@ -148,12 +160,19 @@ def collect_beats_norms(wav_paths, sr, load_vid_len, sequence_length, max_files,
             "min": float(np.min(per_frame_norms)), "max": float(np.max(per_frame_norms)),
             "p5": float(np.percentile(per_frame_norms, 5)), "p50": float(np.percentile(per_frame_norms, 50)),
             "p95": float(np.percentile(per_frame_norms, 95)),
+            "p1": float(np.percentile(per_frame_norms, 1)), "p99": float(np.percentile(per_frame_norms, 99)),
         },
         "pooled_norm": {
             "mean": float(np.mean(pooled_norms)), "std": float(np.std(pooled_norms)),
             "min": float(np.min(pooled_norms)), "max": float(np.max(pooled_norms)),
             "p5": float(np.percentile(pooled_norms, 5)), "p50": float(np.percentile(pooled_norms, 50)),
             "p95": float(np.percentile(pooled_norms, 95)),
+            "p1": float(np.percentile(pooled_norms, 1)), "p99": float(np.percentile(pooled_norms, 99)),
+        },
+        "conf": {
+            "mean": float(np.mean(confs)), "std": float(np.std(confs)),
+            "min": float(np.min(confs)), "max": float(np.max(confs)),
+            "p1": float(np.percentile(confs, 1)), "p99": float(np.percentile(confs, 99)),
         },
     }
 
@@ -169,6 +188,11 @@ def main():
     ap.add_argument("--beats_ckpt", type=str, default="saved_ckpts/BEATs_iter3_plus_AS20K.pt")
     ap.add_argument("--max_clips_per_file", type=int, default=2, help="Random clips per file for BEATs stats")
     ap.add_argument("--out", type=str, default="", help="Optional JSON output path")
+    ap.add_argument("--gate_norm_low", type=float, default=7.2, help="Gate 区间下界（用于 conf 统计）")
+    ap.add_argument("--gate_norm_high", type=float, default=10.0, help="Gate 区间上界")
+    ap.add_argument("--gate_use_zscore", action="store_true", help="Conf 用 z-score 计算")
+    ap.add_argument("--gate_norm_mu", type=float, default=8.4)
+    ap.add_argument("--gate_norm_sigma", type=float, default=0.5)
     args = ap.parse_args()
 
     if args.sr is None:
@@ -217,6 +241,11 @@ def main():
             max_files=min(args.max_files, 50),
             max_clips_per_file=args.max_clips_per_file,
             beats_ckpt=args.beats_ckpt,
+            gate_norm_low=args.gate_norm_low,
+            gate_norm_high=args.gate_norm_high,
+            gate_use_zscore=args.gate_use_zscore,
+            gate_norm_mu=args.gate_norm_mu,
+            gate_norm_sigma=args.gate_norm_sigma,
         )
         print(f"  clips 数: {beats_report['n_clips']}, 帧嵌入数: {beats_report['n_frame_embeddings']}")
         print("  Per-frame norm (每帧 768-d 向量范数):")
@@ -224,6 +253,9 @@ def main():
             print(f"    {k}: {v:.4f}")
         print("  Pooled norm (整 clip mean-pool 后 768-d 范数，用于 MCFL gate 置信度):")
         for k, v in beats_report["pooled_norm"].items():
+            print(f"    {k}: {v:.4f}")
+        print("  Conf (置信度，护栏2 写入 eval JSON 便于排查):")
+        for k, v in beats_report["conf"].items():
             print(f"    {k}: {v:.4f}")
         p = beats_report["pooled_norm"]
         low_sug = max(0.5, p["p5"] - 0.5)

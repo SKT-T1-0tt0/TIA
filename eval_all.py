@@ -666,54 +666,66 @@ class EvaluationRunner:
             if self.baseline_dir:
                 print(f"📹 评估 Baseline 视频: {self.baseline_dir}")
                 videos = sorted([v for v in os.listdir(self.baseline_dir) if v.endswith(".mp4")])
-                
                 vals = []
                 for video_name in tqdm(videos[:50], desc="TC-Flicker Baseline"):
                     video_path = os.path.join(self.baseline_dir, video_name)
                     vals.append(tc_flicker_revised(video_path, smooth_k=3))
-                
+                vals = np.array(vals)
+                n_b = len(vals)
                 mean_val = float(np.mean(vals))
-                std_val = float(np.std(vals))
+                std_val = float(np.std(vals)) if n_b > 1 else 0.0
+                median_val = float(np.median(vals))
                 results["baseline"] = {
                     "flicker": {
                         "mean": mean_val,
                         "std": std_val,
-                        "value": f"{mean_val:.6f} ± {std_val:.6f}"
+                        "median": median_val,
+                        "value": f"{mean_val:.6f} ± {std_val:.6f}",
+                        "value_median": f"{median_val:.6f}",
                     },
                     "tc": {
                         "mean": -mean_val,
                         "std": std_val,
-                        "value": f"{-mean_val:.6f} ± {std_val:.6f}"
-                    }
+                        "median": -median_val,
+                        "value": f"{-mean_val:.6f} ± {std_val:.6f}",
+                        "value_median": f"{-median_val:.6f}",
+                    },
+                    "n_videos": n_b,
                 }
-                print(f"  ✓ Baseline Flicker: {results['baseline']['flicker']['value']}")
-                print(f"  ✓ Baseline TC: {results['baseline']['tc']['value']}")
+                print(f"  ✓ Baseline Flicker: mean={results['baseline']['flicker']['value']}  median={results['baseline']['flicker']['value_median']} (N={n_b})")
+                print(f"  ✓ Baseline TC:      mean={results['baseline']['tc']['value']}  median={results['baseline']['tc']['value_median']}")
             
             if self.mcfl_dir:
                 print(f"📹 评估 MCFL 视频: {self.mcfl_dir}")
                 videos = sorted([v for v in os.listdir(self.mcfl_dir) if v.endswith(".mp4")])
-                
                 vals = []
                 for video_name in tqdm(videos[:50], desc="TC-Flicker MCFL"):
                     video_path = os.path.join(self.mcfl_dir, video_name)
                     vals.append(tc_flicker_revised(video_path, smooth_k=3))
-                
+                vals = np.array(vals)
+                n_m = len(vals)
                 mean_val = float(np.mean(vals))
-                std_val = float(np.std(vals))
+                std_val = float(np.std(vals)) if n_m > 1 else 0.0
+                median_val = float(np.median(vals))
                 results["mcfl"] = {
                     "flicker": {
                         "mean": mean_val,
                         "std": std_val,
-                        "value": f"{mean_val:.6f} ± {std_val:.6f}"
+                        "median": median_val,
+                        "value": f"{mean_val:.6f} ± {std_val:.6f}",
+                        "value_median": f"{median_val:.6f}",
                     },
                     "tc": {
                         "mean": -mean_val,
                         "std": std_val,
-                        "value": f"{-mean_val:.6f} ± {std_val:.6f}"
-                    }
+                        "median": -median_val,
+                        "value": f"{-mean_val:.6f} ± {std_val:.6f}",
+                        "value_median": f"{-median_val:.6f}",
+                    },
+                    "n_videos": n_m,
                 }
-                print(f"  ✓ MCFL Flicker: {results['mcfl']['flicker']['value']}")
-                print(f"  ✓ MCFL TC: {results['mcfl']['tc']['value']}")
+                print(f"  ✓ MCFL Flicker: mean={results['mcfl']['flicker']['value']}  median={results['mcfl']['flicker']['value_median']} (N={n_m})")
+                print(f"  ✓ MCFL TC:      mean={results['mcfl']['tc']['value']}  median={results['mcfl']['tc']['value_median']}")
             
             return results
             
@@ -776,23 +788,26 @@ class EvaluationRunner:
                 continue
             
             if metric_name == "tc_flicker":
-                # TC-Flicker 有两个指标
+                # TC-Flicker: 输出 mean 与 median 两行（小样本时 median 更稳健）
                 for sub_metric in ["flicker", "tc"]:
-                    row = {
-                        "Metric": f"{metric_name.upper()} ({sub_metric})",
-                        "Baseline": "-",
-                        "MCFL": "-",
-                        "Δ": "-"
-                    }
-                    if "baseline" in metric_results and sub_metric in metric_results["baseline"]:
-                        row["Baseline"] = metric_results["baseline"][sub_metric]["value"]
-                    if "mcfl" in metric_results and sub_metric in metric_results["mcfl"]:
-                        row["MCFL"] = metric_results["mcfl"][sub_metric]["value"]
-                    if "baseline" in metric_results and "mcfl" in metric_results:
-                        if sub_metric in metric_results["baseline"] and sub_metric in metric_results["mcfl"]:
-                            delta = metric_results["mcfl"][sub_metric]["mean"] - metric_results["baseline"][sub_metric]["mean"]
+                    for agg in ["mean", "median"]:
+                        label = "median" if agg == "median" else "mean"
+                        row = {
+                            "Metric": f"{metric_name.upper()} ({sub_metric}, {label})",
+                            "Baseline": "-",
+                            "MCFL": "-",
+                            "Δ": "-"
+                        }
+                        b = metric_results.get("baseline", {}).get(sub_metric, {})
+                        m = metric_results.get("mcfl", {}).get(sub_metric, {})
+                        if b:
+                            row["Baseline"] = b.get("value_median" if agg == "median" else "value", b.get("value", "-"))
+                        if m:
+                            row["MCFL"] = m.get("value_median" if agg == "median" else "value", m.get("value", "-"))
+                        if b and m and agg in b and agg in m:
+                            delta = m[agg] - b[agg]
                             row["Δ"] = f"{delta:+.4f}"
-                    table_data.append(row)
+                        table_data.append(row)
             else:
                 display_name = "FVD-32" if metric_name == "fvd_32" else metric_name.upper()
                 row = {
@@ -876,9 +891,37 @@ class EvaluationRunner:
                     f.write(f"  错误: {metric_results['error']}\n")
                 else:
                     if "baseline" in metric_results:
-                        f.write(f"  Baseline: {metric_results['baseline'].get('value', 'N/A')}\n")
+                        b = metric_results["baseline"]
+                        if metric_name == "tc_flicker" and "flicker" in b:
+                            f.write(f"  Baseline: flicker mean={b['flicker'].get('value', 'N/A')}  median={b['flicker'].get('value_median', 'N/A')}")
+                            if b.get("n_videos") is not None:
+                                f.write(f"  (N={b['n_videos']})")
+                            f.write("\n")
+                            f.write(f"            tc      mean={b['tc'].get('value', 'N/A')}  median={b['tc'].get('value_median', 'N/A')}\n")
+                        else:
+                            f.write(f"  Baseline: {b.get('value', 'N/A')}\n")
                     if "mcfl" in metric_results:
-                        f.write(f"  MCFL: {metric_results['mcfl'].get('value', 'N/A')}\n")
+                        m = metric_results["mcfl"]
+                        if metric_name == "tc_flicker" and "flicker" in m:
+                            f.write(f"  MCFL:     flicker mean={m['flicker'].get('value', 'N/A')}  median={m['flicker'].get('value_median', 'N/A')}")
+                            if m.get("n_videos") is not None:
+                                f.write(f"  (N={m['n_videos']})")
+                            f.write("\n")
+                            f.write(f"            tc      mean={m['tc'].get('value', 'N/A')}  median={m['tc'].get('value_median', 'N/A')}\n")
+                        else:
+                            f.write(f"  MCFL: {m.get('value', 'N/A')}\n")
+            
+            # 小样本说明：TC_FLICKER 视频数较少时，mean 易受单条异常值影响
+            n_note = None
+            if "tc_flicker" in self.results and "error" not in self.results.get("tc_flicker", {}):
+                for key in ("baseline", "mcfl"):
+                    r = self.results["tc_flicker"].get(key, {})
+                    if r.get("n_videos") is not None and r["n_videos"] <= 20:
+                        n_note = r["n_videos"]
+                        break
+            if n_note is not None:
+                f.write("\n")
+                f.write("[小样本说明] 当前 TC_FLICKER 评估视频数 N=%d ≤ 20。此时 mean 易受单条异常值（如某条闪烁严重）影响而拉高，不能据此断定 baseline 比 MCFL 更稳定；请优先参考 median。若 median 上 MCFL 与 baseline 接近或更优，说明多数视频时间一致性相当或更好；若仅 mean 差而 median 接近，多为个别失败样本导致。\n" % n_note)
         
         print(f"\n💾 报告已保存到: {self.output_file}")
         print(f"💾 JSON 数据已保存到: {json_file}")

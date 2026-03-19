@@ -76,6 +76,29 @@ class TrainLoop():
         lambda_temp=0.0,  # Temporal smooth regularization weight (default 0.0 = disabled, set > 0 to enable, e.g., 0.01)
         mcfl_conservative=True,  # If True: alpha curriculum + MCFL freeze at 8k + lambda_temp curriculum. If False: full MCFL, no curriculum (for use with baseline imitation).
         use_baseline_imitation=False,  # If True: add online baseline output imitation loss (placeholder; implement when needed).
+        mcfl_norm_modality=True,  # 跨分布鲁棒：送入 MCFL 前对 image/audio 做 L2 归一化
+        audio_response="tanh",  # 送入 BEATs 前强度响应（只做一次）: "none" | "tanh" | "compand"
+        audio_random_gain=True,  # 训练时随机增益 g~log_uniform，让模型学会幅度不可靠
+        audio_gain_range=(0.25, 4.0),  # (low, high)，可改为 (0.25, 8)
+        audio_random_response_strength=True,  # 随机 tanh(kx) 的 k 或 compand 的 μ
+        modality_dropout_prob=0.2,  # 训练时以该概率将 audio cond 置零，学会无可靠音频也稳定
+        mcfl_gate_adaptive=True,  # gate 随音频范数置信度自适应，异常时→0
+        mcfl_gate_norm_low=7.2,  # 统一标定：覆盖 drums/URMP/landscape p5–p95
+        mcfl_gate_norm_high=10.0,
+        mcfl_gate_time_smooth=True,
+        mcfl_gate_ema=0.9,  # 更强时间平滑，减轻 flicker
+        mcfl_gate_use_zscore=False,
+        mcfl_gate_norm_mu=8.4,
+        mcfl_gate_norm_sigma=0.5,
+        mcfl_gate_z_low=-1.5,
+        mcfl_gate_z_high=1.5,
+        mcfl_gate_lambda_max=0.2,  # 护栏1：gate 硬上限
+        mcfl_gate_norm_clip_clamp=True,  # 护栏3：per-frame norm 按 clip p5–p95 限幅
+        # 新增：audio-visual agreement gate 因子
+        mcfl_gate_use_av_conf: bool = False,
+        mcfl_gate_av_sim_low: float = 0.0,
+        mcfl_gate_av_sim_high: float = 0.3,
+        mcfl_gate_av_beta: float = 0.5,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -106,6 +129,28 @@ class TrainLoop():
         self.lambda_temp = lambda_temp  # Temporal smooth regularization weight
         self.mcfl_conservative = mcfl_conservative  # Conservative curriculum (alpha, freeze, lambda_temp) vs full MCFL
         self.use_baseline_imitation = use_baseline_imitation  # Online baseline imitation (placeholder)
+        self.mcfl_norm_modality = mcfl_norm_modality
+        self.audio_response = audio_response
+        self.audio_random_gain = audio_random_gain
+        self.audio_gain_range = tuple(audio_gain_range) if hasattr(audio_gain_range, '__len__') else (0.25, 4.0)
+        self.audio_random_response_strength = audio_random_response_strength
+        self.modality_dropout_prob = modality_dropout_prob
+        self.mcfl_gate_adaptive = mcfl_gate_adaptive
+        self.mcfl_gate_norm_low = mcfl_gate_norm_low
+        self.mcfl_gate_norm_high = mcfl_gate_norm_high
+        self.mcfl_gate_time_smooth = mcfl_gate_time_smooth
+        self.mcfl_gate_ema = mcfl_gate_ema
+        self.mcfl_gate_use_zscore = mcfl_gate_use_zscore
+        self.mcfl_gate_norm_mu = mcfl_gate_norm_mu
+        self.mcfl_gate_norm_sigma = mcfl_gate_norm_sigma
+        self.mcfl_gate_z_low = mcfl_gate_z_low
+        self.mcfl_gate_z_high = mcfl_gate_z_high
+        self.mcfl_gate_lambda_max = mcfl_gate_lambda_max
+        self.mcfl_gate_norm_clip_clamp = mcfl_gate_norm_clip_clamp
+        self.mcfl_gate_use_av_conf = mcfl_gate_use_av_conf
+        self.mcfl_gate_av_sim_low = mcfl_gate_av_sim_low
+        self.mcfl_gate_av_sim_high = mcfl_gate_av_sim_high
+        self.mcfl_gate_av_beta = mcfl_gate_av_beta
         
         # Initialize MCFL if enabled
         if self.use_mcfl:
@@ -324,7 +369,24 @@ class TrainLoop():
                     pooling_mode=self.mcfl_pooling_mode,
                     attn_pool_text=self.attn_pool_text,
                     attn_pool_audio=self.attn_pool_audio,
-                    mcfl_gate_lambda=getattr(self, 'mcfl_gate_lambda', 0.2),  # Default 0.2 for v2-A
+                    mcfl_gate_lambda=getattr(self, 'mcfl_gate_lambda', 0.2),
+                    mcfl_norm_modality=getattr(self, 'mcfl_norm_modality', True),
+                    mcfl_gate_adaptive=getattr(self, 'mcfl_gate_adaptive', True),
+                    mcfl_gate_norm_low=getattr(self, 'mcfl_gate_norm_low', 7.2),
+                    mcfl_gate_norm_high=getattr(self, 'mcfl_gate_norm_high', 10.0),
+                    mcfl_gate_time_smooth=getattr(self, 'mcfl_gate_time_smooth', True),
+                    mcfl_gate_ema=getattr(self, 'mcfl_gate_ema', 0.9),
+                    mcfl_gate_use_zscore=getattr(self, 'mcfl_gate_use_zscore', False),
+                    mcfl_gate_norm_mu=getattr(self, 'mcfl_gate_norm_mu', 8.4),
+                    mcfl_gate_norm_sigma=getattr(self, 'mcfl_gate_norm_sigma', 0.5),
+                    mcfl_gate_z_low=getattr(self, 'mcfl_gate_z_low', -1.5),
+                    mcfl_gate_z_high=getattr(self, 'mcfl_gate_z_high', 1.5),
+                    mcfl_gate_lambda_max=getattr(self, 'mcfl_gate_lambda_max', 0.2),
+                    mcfl_gate_norm_clip_clamp=getattr(self, 'mcfl_gate_norm_clip_clamp', True),
+                    mcfl_gate_use_av_conf=getattr(self, 'mcfl_gate_use_av_conf', False),
+                    mcfl_gate_av_sim_low=getattr(self, 'mcfl_gate_av_sim_low', 0.0),
+                    mcfl_gate_av_sim_high=getattr(self, 'mcfl_gate_av_sim_high', 0.3),
+                    mcfl_gate_av_beta=getattr(self, 'mcfl_gate_av_beta', 0.5),
                 )
                 c_at = c_at.to(dist_util.dev())
 

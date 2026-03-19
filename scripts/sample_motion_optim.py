@@ -163,6 +163,15 @@ def main():
             c_temp = stft
         elif args.audio_emb_model == 'beats':
             audio = rearrange(audio.unsqueeze(0), "b f g -> (b f) g")
+            # 与训练一致（鲁棒 MCFL 音频归一化）：
+            # 数据侧 peak/soft_clip 已由 TAVDataset 根据 args.audio_norm_mode / args.audio_soft_clip 在加载时做完；
+            # 此处仅做单次 response（tanh/compand）再送 BEATs。采样时请传与训练相同的 --audio_norm_mode / --audio_soft_clip / --audio_response
+            resp = getattr(args, 'audio_response', 'compand')
+            if resp == 'tanh':
+                audio = th.tanh(audio)
+            elif resp == 'compand':
+                mu = 5.0
+                audio = th.sign(audio) * th.log1p(mu * th.abs(audio)) / math.log1p(mu)
             # 将音频移到 CPU 上进行处理，因为 BEATs 模型在 CPU 上
             c_temp = BEATs_model.extract_features(audio.cpu(), padding_mask=None)[0] #torch.Size([16, 8, 768])
             # 处理完成后移回 GPU
@@ -179,7 +188,24 @@ def main():
             pooling_mode=mcfl_pooling_mode,
             attn_pool_text=attn_pool_text,
             attn_pool_audio=attn_pool_audio,
-            mcfl_gate_lambda=getattr(args, 'mcfl_gate_lambda', 0.2),  # Default 0.2 for v2-A
+            mcfl_gate_lambda=getattr(args, 'mcfl_gate_lambda', 0.2),
+            mcfl_norm_modality=getattr(args, 'mcfl_norm_modality', True),
+            mcfl_gate_adaptive=getattr(args, 'mcfl_gate_adaptive', True),
+            mcfl_gate_norm_low=getattr(args, 'mcfl_gate_norm_low', 7.2),
+            mcfl_gate_norm_high=getattr(args, 'mcfl_gate_norm_high', 10.0),
+            mcfl_gate_time_smooth=getattr(args, 'mcfl_gate_time_smooth', True),
+            mcfl_gate_ema=getattr(args, 'mcfl_gate_ema', 0.9),
+            mcfl_gate_use_zscore=getattr(args, 'mcfl_gate_use_zscore', False),
+            mcfl_gate_norm_mu=getattr(args, 'mcfl_gate_norm_mu', 8.4),
+            mcfl_gate_norm_sigma=getattr(args, 'mcfl_gate_norm_sigma', 0.5),
+            mcfl_gate_z_low=getattr(args, 'mcfl_gate_z_low', -1.5),
+            mcfl_gate_z_high=getattr(args, 'mcfl_gate_z_high', 1.5),
+            mcfl_gate_lambda_max=getattr(args, 'mcfl_gate_lambda_max', 0.2),
+            mcfl_gate_norm_clip_clamp=getattr(args, 'mcfl_gate_norm_clip_clamp', True),
+            mcfl_gate_use_av_conf=getattr(args, 'mcfl_gate_use_av_conf', False),
+            mcfl_gate_av_sim_low=getattr(args, 'mcfl_gate_av_sim_low', 0.0),
+            mcfl_gate_av_sim_high=getattr(args, 'mcfl_gate_av_sim_high', 0.3),
+            mcfl_gate_av_beta=getattr(args, 'mcfl_gate_av_beta', 0.5),
         )
         c_at = c_at.to(dist_util.dev())
         #c_temp = c_temp.to(dist_util.dev()) 
@@ -278,7 +304,26 @@ def create_argparser():
         use_mcfl=False,  # MCFL flag: enable multi-modal condition fusion
         mcfl_embed_dim=768,  # MCFL embedding dimension (must match condition dimension)
         mcfl_pooling_mode="mean",  # Pooling mode: "mean" (average) or "attention" (learned attention weights)
-        mcfl_gate_lambda=0.2,  # MCFL v2-A gate parameter for gated residual (default 0.2, range [0, 1])
+        mcfl_gate_lambda=0.1,  # 与训练默认一致
+        mcfl_norm_modality=True,
+        mcfl_gate_adaptive=True,
+        mcfl_gate_norm_low=7.2,
+        mcfl_gate_norm_high=10.0,
+        mcfl_gate_time_smooth=True,
+        mcfl_gate_ema=0.9,
+        mcfl_gate_use_zscore=False,
+        mcfl_gate_norm_mu=8.4,
+        mcfl_gate_norm_sigma=0.5,
+        mcfl_gate_z_low=-1.5,
+        mcfl_gate_z_high=1.5,
+        mcfl_gate_lambda_max=0.2,
+        mcfl_gate_norm_clip_clamp=True,
+        # 新增：audio-visual agreement gate 因子（默认关闭）
+        mcfl_gate_use_av_conf=False,
+        mcfl_gate_av_sim_low=0.0,
+        mcfl_gate_av_sim_high=0.3,
+        mcfl_gate_av_beta=0.5,
+        audio_response='compand',  # 与训练稳健默认一致（单次压缩）
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

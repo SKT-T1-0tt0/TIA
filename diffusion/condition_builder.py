@@ -6,8 +6,9 @@ This module provides a unified interface for building conditions with optional M
 """
 
 import torch as th
+import torch.nn.functional as F
 from einops import rearrange, repeat
-from typing import Optional, Tuple, Literal
+from typing import Literal, Optional, Tuple
 
 
 def build_conditions(
@@ -20,6 +21,24 @@ def build_conditions(
     attn_pool_text=None,  # Optional AttnPool for text (if pooling_mode="attention")
     attn_pool_audio=None,  # Optional AttnPool for audio (if pooling_mode="attention")
     mcfl_gate_lambda: float = 0.1,  # Gate parameter for MCFL v2-A (0.1 降低 TC_FLICKER，原 0.2)
+    mcfl_norm_modality: bool = True,  # 跨分布鲁棒：送入 MCFL 前对 image/audio 做 L2 归一化，减弱幅值差异
+    mcfl_gate_adaptive: bool = True,  # 异常输入时 gate→0：用音频 embedding 范数做置信度
+    mcfl_gate_norm_low: float = 7.2,  # 置信度三角形下界（统一标定：覆盖 drums/URMP/landscape p5）
+    mcfl_gate_norm_high: float = 10.0,  # 置信度三角形上界（统一标定：覆盖三数据集 p95）
+    mcfl_gate_time_smooth: bool = True,  # 对 gate 做时间 EMA，减轻 flicker
+    mcfl_gate_ema: float = 0.9,  # gate_t = ema*gate_{t-1} + (1-ema)*gate_raw_t，0.9 更强平滑
+    mcfl_gate_use_zscore: bool = False,  # True: 用 z=(norm-mu)/sigma 标定，跨数据集更稳
+    mcfl_gate_norm_mu: float = 8.4,  # z-score 均值（来自训练/多数据集统计）
+    mcfl_gate_norm_sigma: float = 0.5,  # z-score 标准差
+    mcfl_gate_z_low: float = -1.5,  # z 下界，conf 线性映射
+    mcfl_gate_z_high: float = 1.5,  # z 上界
+    mcfl_gate_lambda_max: Optional[float] = 0.2,  # 护栏1：gate 硬上限，None 表示不启用
+    mcfl_gate_norm_clip_clamp: bool = True,  # 护栏3：per-frame norm 按当前 clip 的 p5–p95 限幅再算 conf，避免单帧 spike
+    # 新增：audio-visual agreement（在现有 norm gate 上再乘一个因子）
+    mcfl_gate_use_av_conf: bool = False,  # True: gate *= ((1-beta)+beta*av_conf)
+    mcfl_gate_av_sim_low: float = 0.0,  # cosine sim 映射下界
+    mcfl_gate_av_sim_high: float = 0.3,  # cosine sim 映射上界
+    mcfl_gate_av_beta: float = 0.5,  # 混合系数：0=不影响，1=纯乘 av_conf（更激进）
 ) -> Tuple[th.Tensor, th.Tensor]:
     """
     Build conditions for diffusion model with optional MCFL fusion.
@@ -90,6 +109,80 @@ def build_conditions(
             else:
                 c_audio_single = c_temp.mean(dim=1)  # [B, D] - audio sequence average
         
+        # 置信度自适应 gate：异常输入时 gate→0（在 L2 norm 前用原始范数）
+        def _conf_from_norm(norm_1d):
+            if mcfl_gate_use_zscore:
+                z = (norm_1d - mcfl_gate_norm_mu) / (mcfl_gate_norm_sigma + 1e-6)
+                return th.clamp(
+                    (z - mcfl_gate_z_low) / (mcfl_gate_z_high - mcfl_gate_z_low + 1e-6), 0.0, 1.0
+                )
+            t_low, t_high = mcfl_gate_norm_low, mcfl_gate_norm_high
+            t_mid = (t_low + t_high) * 0.5
+            span = (t_high - t_low) + 1e-8
+            return th.clamp(1.0 - 2.0 * th.abs(norm_1d - t_mid) / span, 0.0, 1.0)
+
+        def _av_mix_from_feats(audio_feat: th.Tensor, image_feat: th.Tensor):
+            """
+            audio_feat: [..., D]
+            image_feat: [..., D]
+            return:
+              av_mix: [...] in [(1-beta), 1]
+              sim:    [...] cosine similarity
+            """
+            if not mcfl_gate_use_av_conf:
+                return None, None
+            beta = float(mcfl_gate_av_beta)
+            beta = 0.0 if beta < 0 else (1.0 if beta > 1.0 else beta)
+            a = F.normalize(audio_feat, dim=-1, eps=1e-8)
+            v = F.normalize(image_feat, dim=-1, eps=1e-8)
+            sim = (a * v).sum(dim=-1)
+            denom = (mcfl_gate_av_sim_high - mcfl_gate_av_sim_low) + 1e-8
+            av_conf = (sim - mcfl_gate_av_sim_low) / denom
+            av_conf = th.clamp(av_conf, 0.0, 1.0)
+            av_mix = (1.0 - beta) + beta * av_conf
+            return av_mix, sim
+        
+        if mcfl_gate_adaptive and expansion_factor > 1 and mcfl_gate_time_smooth:
+            # 每帧 gate + 时间 EMA 平滑，减轻 flicker
+            c_audio_per_frame = c_temp.mean(dim=1)  # [B*T, D]
+            raw_norm_frame = c_audio_per_frame.norm(dim=-1)  # [B*T]
+            # 护栏3：按当前 clip 的 p5–p95 限幅，避免单帧 spike 把 conf 拉到 0/1
+            if mcfl_gate_norm_clip_clamp:
+                norm_2d = raw_norm_frame.view(B_orig, expansion_factor)  # [B, T]
+                p5 = th.quantile(norm_2d, 0.05, dim=1, keepdim=True)
+                p95 = th.quantile(norm_2d, 0.95, dim=1, keepdim=True)
+                norm_2d = th.clamp(norm_2d, p5, p95)
+                raw_norm_frame = norm_2d.view(-1)
+            conf_frame = _conf_from_norm(raw_norm_frame)  # [B*T]
+            conf_2d = conf_frame.view(B_orig, expansion_factor)  # [B, T]
+            conf_smooth = conf_2d.clone()
+            for t in range(1, expansion_factor):
+                conf_smooth[:, t] = mcfl_gate_ema * conf_smooth[:, t - 1] + (1.0 - mcfl_gate_ema) * conf_2d[:, t]
+
+            # 新增：av agreement（逐帧 audio vs 单图像 embedding）
+            if mcfl_gate_use_av_conf:
+                img_rep = repeat(c_image_single.detach(), "b d -> (b f) d", f=expansion_factor)  # [B*T, D]
+                av_mix_frame, _sim = _av_mix_from_feats(c_audio_per_frame.detach(), img_rep)
+                if av_mix_frame is not None:
+                    conf_smooth = conf_smooth * av_mix_frame.view(B_orig, expansion_factor)
+            gate_per_frame = (mcfl_gate_lambda * conf_smooth.view(-1)).unsqueeze(1)  # [B*T, 1]
+        elif mcfl_gate_adaptive:
+            raw_norm_single = c_audio_single.norm(dim=-1)  # [B]
+            conf = _conf_from_norm(raw_norm_single).unsqueeze(1)  # [B, 1]
+            # 新增：av agreement（clip 级 audio vs image embedding）
+            if mcfl_gate_use_av_conf:
+                av_mix, _sim = _av_mix_from_feats(c_audio_single.detach(), c_image_single.detach())
+                if av_mix is not None:
+                    conf = conf * av_mix.unsqueeze(1)
+            gate_per_frame = mcfl_gate_lambda * conf  # [B, 1]，后面 expand 到 [B*T, 1]
+        else:
+            gate_per_frame = None  # 用固定 lam
+        
+        # 跨分布鲁棒：对 image/audio 做 L2 归一化，使 MCFL 更依赖方向而非幅值
+        if mcfl_norm_modality:
+            c_image_single = c_image_single / (c_image_single.norm(dim=-1, keepdim=True) + 1e-6)
+            c_audio_single = c_audio_single / (c_audio_single.norm(dim=-1, keepdim=True) + 1e-6)
+        
         # MCFL v2-A: Gated Residual
         # Core formula: c_fused = c_text + λ * (MCFL(...) - c_text)
         # This makes fused condition an "increment" rather than full replacement
@@ -108,15 +201,21 @@ def build_conditions(
         delta_scale = 0.2  # 固定幅度（可调：0.1 ~ 0.3）
         delta = delta * delta_scale  # [B, D]
         
-        lam = mcfl_gate_lambda  # Gate parameter (now 0.1, was 0.2)
-        c_fused = c_text_single + lam * delta  # [B, D] - Gated residual
-        
-        # MCFL v2-A: Temporal-only injection
-        # c_ti remains baseline (already set above) - protects spatial quality
-        # Only c_at uses fused condition for temporal/AV alignment
-        
-        # For c_at: expand fused condition to match c_temp's batch dimension [B*T, ...]
-        c_fused_expanded = repeat(c_fused, "b d -> (b f) d", f=expansion_factor)  # [B*T, D]
+        if gate_per_frame is not None:
+            if gate_per_frame.dim() == 2 and gate_per_frame.shape[0] == B_orig and gate_per_frame.shape[1] == 1:
+                gate_expanded = repeat(gate_per_frame, "b 1 -> (b f) 1", f=expansion_factor)
+            else:
+                gate_expanded = gate_per_frame  # 已是 [B*T, 1]
+            # 护栏1：gate 硬上限，即使 conf=1 也不超过 lambda_max，防 FID/条件爆炸
+            if mcfl_gate_lambda_max is not None and mcfl_gate_lambda_max > 0:
+                gate_expanded = th.clamp(gate_expanded, max=mcfl_gate_lambda_max)
+            c_fused_expanded = repeat(c_text_single, "b d -> (b f) d", f=expansion_factor) + gate_expanded * repeat(delta, "b d -> (b f) d", f=expansion_factor)
+        else:
+            lam = mcfl_gate_lambda
+            if mcfl_gate_lambda_max is not None and mcfl_gate_lambda_max > 0:
+                lam = min(lam, mcfl_gate_lambda_max)
+            c_fused = c_text_single + lam * delta  # [B, D]
+            c_fused_expanded = repeat(c_fused, "b d -> (b f) d", f=expansion_factor)
         
         # Expand fused to sequence format: [B*T, T_seq, D]
         # Match the sequence length of c_temp for concatenation

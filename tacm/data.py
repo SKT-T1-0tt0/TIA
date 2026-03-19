@@ -42,6 +42,29 @@ def collate_fn(batch):
 
     return default_collate(batch)
 
+
+def normalize_and_clip_audio(audio, norm_mode='peak', soft_clip='none', rms_target=0.1):
+    """幅度归一化 + soft clipping，提升跨分布泛化。"""
+    if isinstance(audio, np.ndarray):
+        audio = audio.copy()
+    else:
+        audio = audio.numpy().copy() if hasattr(audio, 'numpy') else np.array(audio)
+    if norm_mode == 'peak':
+        peak = np.abs(audio).max()
+        if peak > 1e-8:
+            audio = audio / peak
+    elif norm_mode == 'rms':
+        rms = np.sqrt((audio ** 2).mean() + 1e-8)
+        if rms > 1e-8:
+            audio = audio * (rms_target / rms)
+    if soft_clip == 'tanh':
+        audio = np.tanh(audio)
+    elif soft_clip == 'compand':
+        mu = 5.0
+        audio = np.sign(audio) * np.log1p(mu * np.abs(audio)) / np.log1p(mu)
+    return audio.astype(np.float32)
+
+
 class VideoData(pl.LightningDataModule):
 
     def __init__(self, args, shuffle=True):
@@ -630,7 +653,15 @@ class TAVDataset(data.Dataset):
             audio, _ = librosa.load(audiofile, sr=sr)
             audio = audio.reshape(self.load_vid_len, -1)
             audio = audio[start:end, :]
-            return dict(**preprocess(video[start:end], self.resolution, sample_every_n_frames=self.sample_every_n_frames), 
+            # 幅度归一化 + soft clipping，提升跨分布泛化（如 post_audioset_drums）
+            if getattr(self, 'audio_norm_mode', 'none') != 'none' or getattr(self, 'audio_soft_clip', 'none') != 'none':
+                audio = normalize_and_clip_audio(
+                    audio,
+                    norm_mode=getattr(self, 'audio_norm_mode', 'peak'),
+                    soft_clip=getattr(self, 'audio_soft_clip', 'none'),
+                    rms_target=getattr(self, 'audio_rms_target', 0.1),
+                )
+            return dict(**preprocess(video[start:end], self.resolution, sample_every_n_frames=self.sample_every_n_frames),
                         text=outputs, raw_text=text, audio=torch.tensor(audio), path=self.video_paths[video_idx])
         
         
