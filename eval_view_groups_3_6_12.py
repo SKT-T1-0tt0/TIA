@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-从三组评估报告中筛选并显示指定 tacm 实验 (6, 8, 10) 的结果。
+从三组评估报告中筛选并显示指定 tacm 实验 (3, 6, 12) 的结果。
 
 用法:
-  python3 eval_view_groups_6_8_10.py
-  python3 eval_view_groups_6_8_10.py --input evaluation_report_three_groups.json --output view_6_8_10.txt
-  python3 eval_view_groups_6_8_10.py --groups 6 8 10
+  python3 eval_view_groups_3_6_12.py
+  python3 eval_view_groups_3_6_12.py --input evaluation_report_three_groups.json --output view_3_6_12.txt
+  python3 eval_view_groups_3_6_12.py --groups 3 6 12
 """
 
 import os
@@ -83,7 +83,7 @@ def write_filtered_report(report, filtered_names, output_file):
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("=" * 80 + "\n")
-        f.write(f"评估结果筛选: tacm 实验 6, 8, 10\n")
+        f.write(f"评估结果筛选: tacm 实验 3, 6, 12\n")
         f.write("=" * 80 + "\n")
         f.write(f"生成时间: {report.get('timestamp', 'N/A')}\n")
         f.write("\n")
@@ -131,13 +131,13 @@ def write_filtered_report(report, filtered_names, output_file):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="从三组评估报告中筛选 6, 8, 10 的数据结果")
+    parser = argparse.ArgumentParser(description="从三组评估报告中筛选 3, 6, 12 的数据结果")
     parser.add_argument("--input", type=str, default="evaluation_report_three_groups.json",
                         help="输入的 JSON 报告路径")
-    parser.add_argument("--output", type=str, default="evaluation_report_6_8_10.txt",
+    parser.add_argument("--output", type=str, default="evaluation_report_3_6_12.txt",
                         help="筛选后的 txt 报告路径")
-    parser.add_argument("--groups", type=int, nargs="+", default=[6, 8, 10],
-                        help="要筛选的 tacm 编号 (默认: 6 8 10)")
+    parser.add_argument("--groups", type=int, nargs="+", default=[3, 6, 12],
+                        help="要筛选的 tacm 编号 (默认: 3 6 12)")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):

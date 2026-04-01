@@ -18,6 +18,7 @@ from .resample import LossAwareSampler, UniformSampler
 from .tacm_nn import update_ema
 from .condition_builder import build_conditions
 from tacm import AudioCLIP
+from tacm.modules.learned_gate import LearnedGateRefiner
 import wav2clip
 from beats.BEATs import BEATs, BEATsConfig
 
@@ -31,6 +32,17 @@ from transformers import CLIPProcessor, CLIPModel
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
 INITIAL_LOG_LOSS_SCALE = 20.0
+
+
+def _split_train_checkpoint(raw):
+    """
+    Supports:
+      - legacy: flat UNet state_dict only
+      - new: dict with keys 'model', optional 'mcfl', 'learned_gate_refiner', attn pools
+    """
+    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
+        return raw
+    return {"model": raw}
 
 
 def _get_last_temporal_attn(model):
@@ -99,6 +111,12 @@ class TrainLoop():
         mcfl_gate_av_sim_low: float = 0.0,
         mcfl_gate_av_sim_high: float = 0.3,
         mcfl_gate_av_beta: float = 0.5,
+        mcfl_collab_weight: float = 0.0,  # 协同损失权重，0=关闭；建议 0.01/0.05/0.10，从 0.05 起步
+        learned_gate_enable: bool = False,
+        learned_gate_hidden_dim: int = 16,
+        learned_gate_dropout: float = 0.0,
+        learned_gate_detach_input: bool = True,
+        learned_gate_reg_weight: float = 0.0,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -151,7 +169,13 @@ class TrainLoop():
         self.mcfl_gate_av_sim_low = mcfl_gate_av_sim_low
         self.mcfl_gate_av_sim_high = mcfl_gate_av_sim_high
         self.mcfl_gate_av_beta = mcfl_gate_av_beta
-        
+        self.mcfl_collab_weight = mcfl_collab_weight
+        self.learned_gate_enable = learned_gate_enable
+        self.learned_gate_hidden_dim = learned_gate_hidden_dim
+        self.learned_gate_dropout = learned_gate_dropout
+        self.learned_gate_detach_input = learned_gate_detach_input
+        self.learned_gate_reg_weight = learned_gate_reg_weight
+
         # Initialize MCFL if enabled
         if self.use_mcfl:
             from tacm import MCFL, AttnPool
@@ -172,6 +196,15 @@ class TrainLoop():
             self.mcfl = None
             self.attn_pool_text = None
             self.attn_pool_audio = None
+
+        if self.learned_gate_enable:
+            self.learned_gate_refiner = LearnedGateRefiner(
+                in_dim=4,
+                hidden_dim=self.learned_gate_hidden_dim,
+                dropout=self.learned_gate_dropout,
+            ).to(dist_util.dev())
+        else:
+            self.learned_gate_refiner = None
 
         self._mcfl_frozen = False  # Flag for curriculum: freeze MCFL in Stage 3
 
@@ -198,7 +231,10 @@ class TrainLoop():
                
         #params = filter(lambda p : p.requires_grad, self.mp_trainer.model.parameters())   
         #self.opt = AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
-        self.opt = AdamW(self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay)
+        opt_params = list(self.mp_trainer.master_params)
+        if self.learned_gate_refiner is not None:
+            opt_params += [p for p in self.learned_gate_refiner.parameters() if p.requires_grad]
+        self.opt = AdamW(opt_params, lr=self.lr, weight_decay=self.weight_decay)
              
         if self.resume_step:
             self._load_optimizer_state()
@@ -258,13 +294,31 @@ class TrainLoop():
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
             if dist.get_rank() == 0:
                 logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
-                self.model.load_state_dict(
+                bundle = _split_train_checkpoint(
                     dist_util.load_state_dict(
                         resume_checkpoint, map_location=dist_util.dev()
                     )
                 )
+                self.model.load_state_dict(bundle["model"])
+                if self.mcfl is not None and "mcfl" in bundle:
+                    self.mcfl.load_state_dict(bundle["mcfl"], strict=True)
+                if self.learned_gate_refiner is not None and "learned_gate_refiner" in bundle:
+                    self.learned_gate_refiner.load_state_dict(
+                        bundle["learned_gate_refiner"], strict=True
+                    )
+                if self.attn_pool_text is not None and "attn_pool_text" in bundle:
+                    self.attn_pool_text.load_state_dict(bundle["attn_pool_text"], strict=True)
+                if self.attn_pool_audio is not None and "attn_pool_audio" in bundle:
+                    self.attn_pool_audio.load_state_dict(bundle["attn_pool_audio"], strict=True)
         self.model.to(dist_util.dev())
         dist_util.sync_params(self.model.parameters())
+        if self.mcfl is not None:
+            dist_util.sync_params(self.mcfl.parameters())
+        if self.learned_gate_refiner is not None:
+            dist_util.sync_params(self.learned_gate_refiner.parameters())
+        if self.attn_pool_text is not None:
+            dist_util.sync_params(self.attn_pool_text.parameters())
+            dist_util.sync_params(self.attn_pool_audio.parameters())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.mp_trainer.master_params)
@@ -274,10 +328,11 @@ class TrainLoop():
         if ema_checkpoint:
             if dist.get_rank() == 0:
                 logger.log(f"loading EMA from checkpoint: {ema_checkpoint}...")
-                state_dict = dist_util.load_state_dict(
+                raw = dist_util.load_state_dict(
                     ema_checkpoint, map_location=dist_util.dev()
                 )
-                ema_params = self.mp_trainer.state_dict_to_master_params(state_dict)
+                bundle = _split_train_checkpoint(raw)
+                ema_params = self.mp_trainer.state_dict_to_master_params(bundle["model"])
 
         dist_util.sync_params(ema_params)
         return ema_params
@@ -358,9 +413,11 @@ class TrainLoop():
                 
                 c_temp = c_smoothed.view(BT, M, D)  # [B*T, 8, 768]
 
-                # Use common condition builder (shared with sampling scripts)
-                # MCFL v2-A: Temporal-only + Gated Residual
-                c_ti, c_at = build_conditions(
+                # 生成条件：调用 build_conditions（内部调用 mcfl）
+                # mcfl_collab_weight > 0 时开启协同损失，需 return_collab_loss=True 并塞入 cond
+                use_collab = self.use_mcfl and getattr(self, "mcfl_collab_weight", 0.0) > 0
+                use_gate_reg = self.use_mcfl and getattr(self, "learned_gate_reg_weight", 0.0) > 0
+                _build_kw = dict(
                     c_t=c_t,
                     image_cat=image_cat,
                     c_temp=c_temp,
@@ -387,7 +444,28 @@ class TrainLoop():
                     mcfl_gate_av_sim_low=getattr(self, 'mcfl_gate_av_sim_low', 0.0),
                     mcfl_gate_av_sim_high=getattr(self, 'mcfl_gate_av_sim_high', 0.3),
                     mcfl_gate_av_beta=getattr(self, 'mcfl_gate_av_beta', 0.5),
+                    learned_gate_refiner=self.learned_gate_refiner,
+                    learned_gate_enable=self.learned_gate_enable,
+                    learned_gate_detach_input=self.learned_gate_detach_input,
                 )
+                if use_collab and use_gate_reg:
+                    c_ti, c_at, collab_loss, gate_reg_loss = build_conditions(
+                        **_build_kw, return_collab_loss=True, return_gate_reg_loss=True
+                    )
+                    cond["mcfl_collab_loss"] = collab_loss
+                    cond["learned_gate_reg_loss"] = gate_reg_loss
+                elif use_collab:
+                    c_ti, c_at, collab_loss = build_conditions(
+                        **_build_kw, return_collab_loss=True, return_gate_reg_loss=False
+                    )
+                    cond["mcfl_collab_loss"] = collab_loss
+                elif use_gate_reg:
+                    c_ti, c_at, gate_reg_loss = build_conditions(
+                        **_build_kw, return_collab_loss=False, return_gate_reg_loss=True
+                    )
+                    cond["learned_gate_reg_loss"] = gate_reg_loss
+                else:
+                    c_ti, c_at = build_conditions(**_build_kw, return_collab_loss=False, return_gate_reg_loss=False)
                 c_at = c_at.to(dist_util.dev())
 
                 s = self.step + self.resume_step  # global step
@@ -449,8 +527,13 @@ class TrainLoop():
         self.microbatch = self.batch_size * self.sequence_length
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
+            # mcfl_collab_loss 为标量，不参与切片
             micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
+                k: (
+                    v.to(dist_util.dev())
+                    if k in {"mcfl_collab_loss", "learned_gate_reg_loss"}
+                    else v[i : i + self.microbatch].to(dist_util.dev())
+                )
                 for k, v in cond.items()
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
@@ -610,6 +693,25 @@ class TrainLoop():
                 logger.logkv_mean("loss_temp", loss_temp.item())
             # ========================================================================
 
+            # ========== OPTIONAL: MCFL Collaborative Loss（协同损失最小化）==========
+            # L_collab = 1 - cos(z_img_post, z_aud_post)，促进 MCFL 内 image/audio token 对齐
+            # 开关：mcfl_collab_weight > 0 时启用
+            # ========================================================================
+            if self.use_mcfl and getattr(self, "mcfl_collab_weight", 0.0) > 0:
+                collab_loss = cond.get("mcfl_collab_loss", None)
+                if collab_loss is not None:
+                    loss = loss + self.mcfl_collab_weight * collab_loss
+                    logger.logkv_mean("loss_collab", collab_loss.item())
+            # ========================================================================
+
+            # ========== OPTIONAL: Learned Gate Regularization ==========
+            if self.use_mcfl and getattr(self, "learned_gate_reg_weight", 0.0) > 0:
+                gate_reg_loss = cond.get("learned_gate_reg_loss", None)
+                if gate_reg_loss is not None:
+                    loss = loss + self.learned_gate_reg_weight * gate_reg_loss
+                    logger.logkv_mean("loss_gate_reg", gate_reg_loss.item())
+            # ===========================================================
+
             self.mp_trainer.backward(loss)
 
     def _update_ema(self):
@@ -631,6 +733,23 @@ class TrainLoop():
     def save(self):
         def save_checkpoint(rate, params):
             state_dict = self.mp_trainer.master_params_to_state_dict(params)
+            # Bundle MCFL / learned gate / attn pools so sampling can load the same weights.
+            if (
+                self.mcfl is not None
+                or self.learned_gate_refiner is not None
+                or self.attn_pool_text is not None
+            ):
+                payload = {"model": state_dict}
+                if self.mcfl is not None:
+                    payload["mcfl"] = self.mcfl.state_dict()
+                if self.learned_gate_refiner is not None:
+                    payload["learned_gate_refiner"] = self.learned_gate_refiner.state_dict()
+                if self.attn_pool_text is not None:
+                    payload["attn_pool_text"] = self.attn_pool_text.state_dict()
+                    payload["attn_pool_audio"] = self.attn_pool_audio.state_dict()
+                to_save = payload
+            else:
+                to_save = state_dict
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
@@ -638,7 +757,7 @@ class TrainLoop():
                 else:
                     filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
                 with bf.BlobFile(bf.join(self.save_dir, filename), "wb") as f:
-                    th.save(state_dict, f)
+                    th.save(to_save, f)
 
         save_checkpoint(0, self.mp_trainer.master_params)
         for rate, params in zip(self.ema_rate, self.ema_params):

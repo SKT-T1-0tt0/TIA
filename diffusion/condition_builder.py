@@ -11,6 +11,44 @@ from einops import rearrange, repeat
 from typing import Literal, Optional, Tuple
 
 
+def _safe_std(x: th.Tensor, dim: int, keepdim: bool = False) -> th.Tensor:
+    if x.shape[dim] <= 1:
+        return th.zeros_like(x.mean(dim=dim, keepdim=keepdim))
+    return x.std(dim=dim, keepdim=keepdim, unbiased=False)
+
+
+def _build_learned_gate_features(
+    c_image_single: th.Tensor,   # [B, D]
+    c_audio_single: th.Tensor,   # [B, D]
+    c_temp: th.Tensor,           # [B*T, M, D]
+    B_orig: int,
+    expansion_factor: int,
+    detach_input: bool = True,
+) -> th.Tensor:
+    """
+    Build clip-level learned gate features [B, 4]:
+      1) pooled audio feature norm
+      2) pooled image feature norm
+      3) audio-image cosine similarity
+      4) temporal std of per-frame audio norm
+    """
+    BT, M, D = c_temp.shape
+    _ = BT
+    c_temp_btmd = c_temp.view(B_orig, expansion_factor, M, D)
+    c_temp_frame = c_temp_btmd.mean(dim=2)  # [B, T, D]
+
+    audio_norm = c_audio_single.norm(dim=-1, keepdim=True)  # [B, 1]
+    image_norm = c_image_single.norm(dim=-1, keepdim=True)  # [B, 1]
+    av_cos = F.cosine_similarity(c_audio_single, c_image_single, dim=-1).unsqueeze(-1)  # [B, 1]
+    frame_audio_norm = c_temp_frame.norm(dim=-1)  # [B, T]
+    audio_time_std = _safe_std(frame_audio_norm, dim=1, keepdim=True)  # [B, 1]
+
+    feat = th.cat([audio_norm, image_norm, av_cos, audio_time_std], dim=-1)  # [B, 4]
+    if detach_input:
+        feat = feat.detach()
+    return feat
+
+
 def build_conditions(
     c_t: th.Tensor,  # [B, N, D] - text condition
     image_cat: th.Tensor,  # [B, 1, D] - image condition
@@ -39,6 +77,11 @@ def build_conditions(
     mcfl_gate_av_sim_low: float = 0.0,  # cosine sim 映射下界
     mcfl_gate_av_sim_high: float = 0.3,  # cosine sim 映射上界
     mcfl_gate_av_beta: float = 0.5,  # 混合系数：0=不影响，1=纯乘 av_conf（更激进）
+    return_collab_loss: bool = False,  # True 时返回 (c_ti, c_at, collab_loss)，用于协同损失最小化
+    learned_gate_refiner=None,  # Optional learned gate refiner module
+    learned_gate_enable: bool = False,
+    learned_gate_detach_input: bool = True,
+    return_gate_reg_loss: bool = False,  # True 时返回 gate_reg_loss
 ) -> Tuple[th.Tensor, th.Tensor]:
     """
     Build conditions for diffusion model with optional MCFL fusion.
@@ -72,7 +115,10 @@ def build_conditions(
     B_orig = c_t.shape[0]  # Original batch size B
     B_temp = c_temp.shape[0]  # c_temp's batch dimension (might be B*T)
     expansion_factor = B_temp // B_orig if B_temp > B_orig else 1
-    
+
+    collab_loss = None
+    gate_reg_loss = None
+
     # MCFL branch: condition fusion
     if use_mcfl and mcfl is not None:
         # Extract single embeddings from sequences (pooling) - use original batch B
@@ -183,16 +229,23 @@ def build_conditions(
             c_image_single = c_image_single / (c_image_single.norm(dim=-1, keepdim=True) + 1e-6)
             c_audio_single = c_audio_single / (c_audio_single.norm(dim=-1, keepdim=True) + 1e-6)
         
-        # MCFL v2-A: Gated Residual
+        # MCFL v2-A: Gated Residual + optional collaborative loss
         # Core formula: c_fused = c_text + λ * (MCFL(...) - c_text)
-        # This makes fused condition an "increment" rather than full replacement
-        
         # 🔪 第二刀：对 MCFL 梯度做"半截断"（image/audio detach，text 保留梯度）
-        c_hat = mcfl(
-            c_text_single,
-            c_image_single.detach(),
-            c_audio_single.detach()
-        )  # [B, D] - MCFL output
+        if return_collab_loss:
+            c_hat, collab_loss = mcfl(
+                c_text_single,
+                c_image_single.detach(),
+                c_audio_single.detach(),
+                return_collab_loss=True,
+            )  # c_hat: [B, D], collab_loss: scalar
+        else:
+            c_hat = mcfl(
+                c_text_single,
+                c_image_single.detach(),
+                c_audio_single.detach(),
+                return_collab_loss=False,
+            )  # [B, D] - MCFL output
         
         # 🔪 第一刀：对 delta 做 norm + scale（保留方向，抹掉幅值不稳定性）
         delta = c_hat - c_text_single  # [B, D]
@@ -201,7 +254,30 @@ def build_conditions(
         delta_scale = 0.2  # 固定幅度（可调：0.1 ~ 0.3）
         delta = delta * delta_scale  # [B, D]
         
+        learned_factor = None
+        if learned_gate_enable and learned_gate_refiner is not None:
+            gate_feat = _build_learned_gate_features(
+                c_image_single=c_image_single,
+                c_audio_single=c_audio_single,
+                c_temp=c_temp,
+                B_orig=B_orig,
+                expansion_factor=expansion_factor,
+                detach_input=learned_gate_detach_input,
+            )  # [B, 4]
+            learned_factor = learned_gate_refiner(gate_feat)  # [B, 1]
+
+            if return_gate_reg_loss:
+                target_mean = 0.8
+                gate_reg_loss = (learned_factor.mean() - target_mean).pow(2)
+
         if gate_per_frame is not None:
+            if learned_factor is not None:
+                if gate_per_frame.dim() == 2 and gate_per_frame.shape[0] == B_orig and gate_per_frame.shape[1] == 1:
+                    gate_per_frame = gate_per_frame * learned_factor
+                else:
+                    learned_factor_expanded = repeat(learned_factor, "b 1 -> (b f) 1", f=expansion_factor)
+                    gate_per_frame = gate_per_frame * learned_factor_expanded
+
             if gate_per_frame.dim() == 2 and gate_per_frame.shape[0] == B_orig and gate_per_frame.shape[1] == 1:
                 gate_expanded = repeat(gate_per_frame, "b 1 -> (b f) 1", f=expansion_factor)
             else:
@@ -212,9 +288,15 @@ def build_conditions(
             c_fused_expanded = repeat(c_text_single, "b d -> (b f) d", f=expansion_factor) + gate_expanded * repeat(delta, "b d -> (b f) d", f=expansion_factor)
         else:
             lam = mcfl_gate_lambda
-            if mcfl_gate_lambda_max is not None and mcfl_gate_lambda_max > 0:
-                lam = min(lam, mcfl_gate_lambda_max)
-            c_fused = c_text_single + lam * delta  # [B, D]
+            if learned_factor is not None:
+                lam_per_clip = lam * learned_factor  # [B, 1]
+                if mcfl_gate_lambda_max is not None and mcfl_gate_lambda_max > 0:
+                    lam_per_clip = th.clamp(lam_per_clip, max=mcfl_gate_lambda_max)
+                c_fused = c_text_single + lam_per_clip * delta  # [B, D]
+            else:
+                if mcfl_gate_lambda_max is not None and mcfl_gate_lambda_max > 0:
+                    lam = min(lam, mcfl_gate_lambda_max)
+                c_fused = c_text_single + lam * delta  # [B, D]
             c_fused_expanded = repeat(c_fused, "b d -> (b f) d", f=expansion_factor)
         
         # Expand fused to sequence format: [B*T, T_seq, D]
@@ -228,5 +310,11 @@ def build_conditions(
         # c_t: [B, N, D] → [B*T, N, D] to match c_temp: [B*T, T_seq, D]
         c_t_expanded = repeat(c_t, "b n d -> (b f) n d", f=expansion_factor)  # [B*T, N, D]
         c_at = th.concat((c_temp, c_t_expanded), dim=1)  # [B*T, T_seq+N, D]
-    
+
+    if return_collab_loss and return_gate_reg_loss:
+        return c_ti, c_at, collab_loss, gate_reg_loss
+    if return_collab_loss and collab_loss is not None:
+        return c_ti, c_at, collab_loss
+    if return_gate_reg_loss:
+        return c_ti, c_at, gate_reg_loss
     return c_ti, c_at

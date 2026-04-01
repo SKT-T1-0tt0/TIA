@@ -123,6 +123,7 @@ class EvaluationRunner:
         real_dir: str,
         baseline_dir: Optional[str] = None,
         mcfl_dir: Optional[str] = None,
+        mcfl2_dir: Optional[str] = None,
         prompt_file: str = "prompts.txt",
         device: str = "cuda",
         use_bootstrap: bool = True,
@@ -135,6 +136,7 @@ class EvaluationRunner:
             real_dir: 真实视频目录
             baseline_dir: Baseline 生成视频目录（可选）
             mcfl_dir: MCFL 生成视频目录（可选）
+            mcfl2_dir: MCFL 2.0 生成视频目录（可选，三路对比时使用）
             prompt_file: 提示词文件路径（用于 CLIP 评估）
             device: 计算设备
             use_bootstrap: 是否使用 bootstrap 采样
@@ -145,6 +147,7 @@ class EvaluationRunner:
         self.real_dir = real_dir
         self.baseline_dir = baseline_dir
         self.mcfl_dir = mcfl_dir
+        self.mcfl2_dir = mcfl2_dir
         self.prompt_file = prompt_file
         self.device = device
         self.use_bootstrap = use_bootstrap
@@ -244,6 +247,32 @@ class EvaluationRunner:
                     }
                 print(f"  ✓ MCFL {label}: {results['mcfl']['value']}")
             
+            if self.mcfl2_dir:
+                print(f"📹 提取 MCFL 2.0 视频特征: {self.mcfl2_dir}")
+                feats_mcfl2 = extract_fvd_features(
+                    self.mcfl2_dir, use_cache=self.use_cache, num_frames=num_frames
+                )
+                min_len = min(len(feats_real), len(feats_mcfl2))
+                feats_real_aligned = feats_real[:min_len]
+                feats_mcfl2_aligned = feats_mcfl2[:min_len]
+                if self.use_bootstrap:
+                    mean_fvd, std_fvd = bootstrap_fvd_func(
+                        feats_real_aligned, feats_mcfl2_aligned, k=self.bootstrap_k
+                    )
+                    results["mcfl2"] = {
+                        "mean": float(mean_fvd),
+                        "std": float(std_fvd),
+                        "value": f"{mean_fvd:.2f} ± {std_fvd:.2f}"
+                    }
+                else:
+                    fvd_val = compute_fvd(feats_real_aligned, feats_mcfl2_aligned)
+                    results["mcfl2"] = {
+                        "mean": float(fvd_val),
+                        "std": 0.0,
+                        "value": f"{fvd_val:.2f}"
+                    }
+                print(f"  ✓ MCFL 2.0 {label}: {results['mcfl2']['value']}")
+            
             return results
             
         except Exception as e:
@@ -338,6 +367,32 @@ class EvaluationRunner:
                     }
                 print(f"  ✓ MCFL FID: {results['mcfl']['value']}")
             
+            if self.mcfl2_dir:
+                print(f"📹 提取 MCFL 2.0 视频特征: {self.mcfl2_dir}")
+                feats_mcfl2 = extract_inception_features(
+                    self.mcfl2_dir, use_cache=self.use_cache
+                )
+                min_len = min(len(feats_real), len(feats_mcfl2))
+                feats_real_aligned = feats_real[:min_len]
+                feats_mcfl2_aligned = feats_mcfl2[:min_len]
+                if self.use_bootstrap:
+                    mean_fid, std_fid = bootstrap_fid_func(
+                        feats_real_aligned, feats_mcfl2_aligned, k=self.bootstrap_k
+                    )
+                    results["mcfl2"] = {
+                        "mean": float(mean_fid),
+                        "std": float(std_fid),
+                        "value": f"{mean_fid:.2f} ± {std_fid:.2f}"
+                    }
+                else:
+                    fid_val = compute_fid(feats_real_aligned, feats_mcfl2_aligned)
+                    results["mcfl2"] = {
+                        "mean": float(fid_val),
+                        "std": 0.0,
+                        "value": f"{fid_val:.2f}"
+                    }
+                print(f"  ✓ MCFL 2.0 FID: {results['mcfl2']['value']}")
+            
             return results
             
         except Exception as e:
@@ -403,6 +458,24 @@ class EvaluationRunner:
                         "value": f"{mean_ffc:.4f}"
                     }
                 print(f"  ✓ MCFL FFC: {results['mcfl']['value']}")
+            
+            if self.mcfl2_dir:
+                print(f"📹 评估 MCFL 2.0 视频: {self.mcfl2_dir}")
+                mean_ffc, scores = compute_ffc_func(self.mcfl2_dir, use_cache=self.use_cache)
+                if self.use_bootstrap:
+                    mean_ffc_bs, std_ffc = bootstrap_ffc_func(scores, k=self.bootstrap_k)
+                    results["mcfl2"] = {
+                        "mean": float(mean_ffc_bs),
+                        "std": float(std_ffc),
+                        "value": f"{mean_ffc_bs:.4f} ± {std_ffc:.4f}"
+                    }
+                else:
+                    results["mcfl2"] = {
+                        "mean": float(mean_ffc),
+                        "std": 0.0,
+                        "value": f"{mean_ffc:.4f}"
+                    }
+                print(f"  ✓ MCFL 2.0 FFC: {results['mcfl2']['value']}")
             
             return results
             
@@ -515,6 +588,16 @@ class EvaluationRunner:
                     "value": f"{mean_score:.4f} ± {std_score:.4f}"
                 }
                 print(f"  ✓ MCFL CLIP: {results['mcfl']['value']}")
+
+            if self.mcfl2_dir:
+                print(f"📹 评估 MCFL 2.0 视频: {self.mcfl2_dir}")
+                mean_score, std_score = clip_video_text_score(self.mcfl2_dir, prompts)
+                results["mcfl2"] = {
+                    "mean": float(mean_score),
+                    "std": float(std_score),
+                    "value": f"{mean_score:.4f} ± {std_score:.4f}"
+                }
+                print(f"  ✓ MCFL 2.0 CLIP: {results['mcfl2']['value']}")
             
             return results
             
@@ -643,6 +726,33 @@ class EvaluationRunner:
                         "value": f"{mean_score:.4f} ± {std_score:.4f}"
                     }
                     print(f"  ✓ MCFL AV-Align: {results['mcfl']['value']}")
+
+            if self.mcfl2_dir:
+                print(f"📹 评估 MCFL 2.0 视频: {self.mcfl2_dir}")
+                audio_dir = self.mcfl2_dir.replace("/fake1_30fps", "/audio").replace("/fake1_6fps", "/audio")
+                scores = []
+                videos = sorted([v for v in os.listdir(self.mcfl2_dir) if v.endswith(".mp4")])
+                for video_name in tqdm(videos[:50], desc="AV-Align MCFL 2.0"):
+                    video_path = os.path.join(self.mcfl2_dir, video_name)
+                    video_id = re.findall(r"\d+", video_name)
+                    if video_id:
+                        audio_name = f"groundtruth_{video_id[0]}.wav"
+                    else:
+                        audio_name = video_name.replace(".mp4", ".wav")
+                    audio_path = os.path.join(audio_dir, audio_name)
+                    if os.path.exists(audio_path):
+                        m = motion_energy(video_path)
+                        ae = audio_energy(audio_path, len(m))
+                        scores.append(max_corr(m, ae, max_lag=5))
+                if scores:
+                    mean_score = float(np.mean(scores))
+                    std_score = float(np.std(scores))
+                    results["mcfl2"] = {
+                        "mean": mean_score,
+                        "std": std_score,
+                        "value": f"{mean_score:.4f} ± {std_score:.4f}"
+                    }
+                    print(f"  ✓ MCFL 2.0 AV-Align: {results['mcfl2']['value']}")
             
             return results
             
@@ -726,6 +836,38 @@ class EvaluationRunner:
                 }
                 print(f"  ✓ MCFL Flicker: mean={results['mcfl']['flicker']['value']}  median={results['mcfl']['flicker']['value_median']} (N={n_m})")
                 print(f"  ✓ MCFL TC:      mean={results['mcfl']['tc']['value']}  median={results['mcfl']['tc']['value_median']}")
+
+            if self.mcfl2_dir:
+                print(f"📹 评估 MCFL 2.0 视频: {self.mcfl2_dir}")
+                videos = sorted([v for v in os.listdir(self.mcfl2_dir) if v.endswith(".mp4")])
+                vals = []
+                for video_name in tqdm(videos[:50], desc="TC-Flicker MCFL 2.0"):
+                    video_path = os.path.join(self.mcfl2_dir, video_name)
+                    vals.append(tc_flicker_revised(video_path, smooth_k=3))
+                vals = np.array(vals)
+                n_m2 = len(vals)
+                mean_val = float(np.mean(vals))
+                std_val = float(np.std(vals)) if n_m2 > 1 else 0.0
+                median_val = float(np.median(vals))
+                results["mcfl2"] = {
+                    "flicker": {
+                        "mean": mean_val,
+                        "std": std_val,
+                        "median": median_val,
+                        "value": f"{mean_val:.6f} ± {std_val:.6f}",
+                        "value_median": f"{median_val:.6f}",
+                    },
+                    "tc": {
+                        "mean": -mean_val,
+                        "std": std_val,
+                        "median": -median_val,
+                        "value": f"{-mean_val:.6f} ± {std_val:.6f}",
+                        "value_median": f"{-median_val:.6f}",
+                    },
+                    "n_videos": n_m2,
+                }
+                print(f"  ✓ MCFL 2.0 Flicker: mean={results['mcfl2']['flicker']['value']}  median={results['mcfl2']['flicker']['value_median']} (N={n_m2})")
+                print(f"  ✓ MCFL 2.0 TC:      mean={results['mcfl2']['tc']['value']}  median={results['mcfl2']['tc']['value_median']}")
             
             return results
             
@@ -744,6 +886,8 @@ class EvaluationRunner:
             print(f"Baseline 目录: {self.baseline_dir}")
         if self.mcfl_dir:
             print(f"MCFL 目录: {self.mcfl_dir}")
+        if self.mcfl2_dir:
+            print(f"MCFL 2.0 目录: {self.mcfl2_dir}")
         print(f"评估指标: {', '.join(metrics)}")
         print("="*80)
         
@@ -787,8 +931,8 @@ class EvaluationRunner:
             if "error" in metric_results:
                 continue
             
+            has_mcfl2 = "mcfl2" in metric_results
             if metric_name == "tc_flicker":
-                # TC-Flicker: 输出 mean 与 median 两行（小样本时 median 更稳健）
                 for sub_metric in ["flicker", "tc"]:
                     for agg in ["mean", "median"]:
                         label = "median" if agg == "median" else "mean"
@@ -798,15 +942,19 @@ class EvaluationRunner:
                             "MCFL": "-",
                             "Δ": "-"
                         }
+                        if has_mcfl2:
+                            row["MCFL2"] = "-"
                         b = metric_results.get("baseline", {}).get(sub_metric, {})
                         m = metric_results.get("mcfl", {}).get(sub_metric, {})
+                        m2 = metric_results.get("mcfl2", {}).get(sub_metric, {}) if has_mcfl2 else {}
                         if b:
                             row["Baseline"] = b.get("value_median" if agg == "median" else "value", b.get("value", "-"))
                         if m:
                             row["MCFL"] = m.get("value_median" if agg == "median" else "value", m.get("value", "-"))
+                        if has_mcfl2 and m2:
+                            row["MCFL2"] = m2.get("value_median" if agg == "median" else "value", m2.get("value", "-"))
                         if b and m and agg in b and agg in m:
-                            delta = m[agg] - b[agg]
-                            row["Δ"] = f"{delta:+.4f}"
+                            row["Δ"] = f"{m[agg] - b[agg]:+.4f}"
                         table_data.append(row)
             else:
                 display_name = "FVD-32" if metric_name == "fvd_32" else metric_name.upper()
@@ -816,33 +964,30 @@ class EvaluationRunner:
                     "MCFL": "-",
                     "Δ": "-"
                 }
+                if has_mcfl2:
+                    row["MCFL2"] = "-"
                 if "baseline" in metric_results:
                     row["Baseline"] = metric_results["baseline"]["value"]
                 if "mcfl" in metric_results:
                     row["MCFL"] = metric_results["mcfl"]["value"]
+                if has_mcfl2 and "mcfl2" in metric_results:
+                    row["MCFL2"] = metric_results["mcfl2"]["value"]
                 if "baseline" in metric_results and "mcfl" in metric_results:
-                    delta = metric_results["mcfl"]["mean"] - metric_results["baseline"]["mean"]
-                    row["Δ"] = f"{delta:+.4f}"
+                    row["Δ"] = f"{metric_results['mcfl']['mean'] - metric_results['baseline']['mean']:+.4f}"
                 table_data.append(row)
         
         # 打印表格
         if table_data:
-            # 计算列宽
-            col_widths = {
-                "Metric": max(len(row["Metric"]) for row in table_data) + 2,
-                "Baseline": max(len(row["Baseline"]) for row in table_data) + 2,
-                "MCFL": max(len(row["MCFL"]) for row in table_data) + 2,
-                "Δ": max(len(row["Δ"]) for row in table_data) + 2,
-            }
-            
-            # 打印表头
-            header = f"{'Metric':<{col_widths['Metric']}} | {'Baseline':<{col_widths['Baseline']}} | {'MCFL':<{col_widths['MCFL']}} | {'Δ':<{col_widths['Δ']}}"
+            cols = ["Metric", "Baseline", "MCFL"]
+            if any("MCFL2" in row for row in table_data):
+                cols.append("MCFL2")
+            cols.append("Δ")
+            col_widths = {c: max(len(str(row.get(c, "-"))) for row in table_data) + 2 for c in cols}
+            header = " | ".join(f"{c:<{col_widths[c]}}" for c in cols)
             print(header)
             print("-" * len(header))
-            
-            # 打印数据行
             for row in table_data:
-                print(f"{row['Metric']:<{col_widths['Metric']}} | {row['Baseline']:<{col_widths['Baseline']}} | {row['MCFL']:<{col_widths['MCFL']}} | {row['Δ']:<{col_widths['Δ']}}")
+                print(" | ".join(f"{str(row.get(c, '-')):<{col_widths[c]}}" for c in cols))
         
         print("="*80)
         
@@ -861,6 +1006,7 @@ class EvaluationRunner:
                 "real_dir": self.real_dir,
                 "baseline_dir": self.baseline_dir,
                 "mcfl_dir": self.mcfl_dir,
+                "mcfl2_dir": self.mcfl2_dir,
                 "use_bootstrap": self.use_bootstrap,
                 "bootstrap_k": self.bootstrap_k,
             },
@@ -883,6 +1029,8 @@ class EvaluationRunner:
                 f.write(f"Baseline 目录: {self.baseline_dir}\n")
             if self.mcfl_dir:
                 f.write(f"MCFL 目录: {self.mcfl_dir}\n")
+            if self.mcfl2_dir:
+                f.write(f"MCFL 2.0 目录: {self.mcfl2_dir}\n")
             f.write("="*80 + "\n\n")
             
             for metric_name, metric_results in self.results.items():
@@ -910,11 +1058,21 @@ class EvaluationRunner:
                             f.write(f"            tc      mean={m['tc'].get('value', 'N/A')}  median={m['tc'].get('value_median', 'N/A')}\n")
                         else:
                             f.write(f"  MCFL: {m.get('value', 'N/A')}\n")
+                    if "mcfl2" in metric_results:
+                        m2 = metric_results["mcfl2"]
+                        if metric_name == "tc_flicker" and "flicker" in m2:
+                            f.write(f"  MCFL 2.0: flicker mean={m2['flicker'].get('value', 'N/A')}  median={m2['flicker'].get('value_median', 'N/A')}")
+                            if m2.get("n_videos") is not None:
+                                f.write(f"  (N={m2['n_videos']})")
+                            f.write("\n")
+                            f.write(f"            tc      mean={m2['tc'].get('value', 'N/A')}  median={m2['tc'].get('value_median', 'N/A')}\n")
+                        else:
+                            f.write(f"  MCFL 2.0: {m2.get('value', 'N/A')}\n")
             
             # 小样本说明：TC_FLICKER 视频数较少时，mean 易受单条异常值影响
             n_note = None
             if "tc_flicker" in self.results and "error" not in self.results.get("tc_flicker", {}):
-                for key in ("baseline", "mcfl"):
+                for key in ("baseline", "mcfl", "mcfl2"):
                     r = self.results["tc_flicker"].get(key, {})
                     if r.get("n_videos") is not None and r["n_videos"] <= 20:
                         n_note = r["n_videos"]
@@ -959,6 +1117,8 @@ def main():
                         help="Baseline 生成视频目录（可选）")
     parser.add_argument("--mcfl_dir", type=str, default=None,
                         help="MCFL 生成视频目录（可选）")
+    parser.add_argument("--mcfl2_dir", type=str, default=None,
+                        help="MCFL 2.0 生成视频目录（可选，三路对比时使用）")
     parser.add_argument("--prompt_file", type=str, default="prompts.txt",
                         help="提示词文件路径（用于 CLIP 评估）")
     parser.add_argument("--metrics", type=str, nargs="+",
@@ -990,8 +1150,11 @@ def main():
     if args.mcfl_dir and not os.path.exists(args.mcfl_dir):
         print(f"⚠️  MCFL 目录不存在: {args.mcfl_dir}")
         args.mcfl_dir = None
+    if args.mcfl2_dir and not os.path.exists(args.mcfl2_dir):
+        print(f"⚠️  MCFL 2.0 目录不存在: {args.mcfl2_dir}")
+        args.mcfl2_dir = None
     
-    if not args.baseline_dir and not args.mcfl_dir:
+    if not args.baseline_dir and not args.mcfl_dir and not args.mcfl2_dir:
         print("❌ 至少需要提供一个生成视频目录（--baseline_dir 或 --mcfl_dir）")
         return
     
@@ -1000,6 +1163,7 @@ def main():
         real_dir=args.real_dir,
         baseline_dir=args.baseline_dir,
         mcfl_dir=args.mcfl_dir,
+        mcfl2_dir=args.mcfl2_dir,
         prompt_file=args.prompt_file,
         device=args.device,
         use_bootstrap=not args.no_bootstrap,

@@ -4,6 +4,7 @@ Generate a large batch of video samples from a model.
 import sys
 sys.path.append('/data/workspace/TACM')
 import argparse
+import math
 import os
 import time
 import numpy as np
@@ -24,6 +25,7 @@ from diffusion.tacm_script_temp_util import (
 
 from diffusion.dist_util import save_video_grid
 from tacm import VideoData
+from tacm.modules.learned_gate import LearnedGateRefiner
 from tacm.download import load_vqgan
 from einops import rearrange, repeat
 import wav2clip
@@ -40,6 +42,13 @@ import transformers.image_transforms
 from PIL import Image
 from torchvision import transforms
 from transformers import CLIPProcessor, CLIPModel
+
+def _split_train_checkpoint(raw):
+    """Legacy flat UNet dict vs bundled checkpoint from TrainLoop.save()."""
+    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
+        return raw
+    return {"model": raw}
+
 
 def disabled_train(self, mode=True):
     """Overwrite model.train with this function to make sure train/eval mode
@@ -68,9 +77,9 @@ def main():
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
-    model.load_state_dict(
-        dist_util.load_state_dict(args.model_path, map_location="cpu")
-    )
+    ckpt_raw = dist_util.load_state_dict(args.model_path, map_location="cpu")
+    ckpt = _split_train_checkpoint(ckpt_raw)
+    model.load_state_dict(ckpt["model"])
     model.to(dist_util.dev())
     model.eval()
 
@@ -105,6 +114,7 @@ def main():
     attn_pool_audio = None
     mcfl_pooling_mode = getattr(args, 'mcfl_pooling_mode', 'mean')
     
+    learned_gate_refiner = None
     if args.use_mcfl:
         from tacm import MCFL, AttnPool
         mcfl = MCFL(
@@ -117,7 +127,41 @@ def main():
         if mcfl_pooling_mode == "attention":
             attn_pool_text = AttnPool(dim=args.mcfl_embed_dim).to(dist_util.dev())
             attn_pool_audio = AttnPool(dim=args.mcfl_embed_dim).to(dist_util.dev())
-            
+
+        if getattr(args, "learned_gate_enable", False):
+            learned_gate_refiner = LearnedGateRefiner(
+                in_dim=4,
+                hidden_dim=getattr(args, "learned_gate_hidden_dim", 16),
+                dropout=getattr(args, "learned_gate_dropout", 0.0),
+            ).to(dist_util.dev())
+
+        # Load MCFL / learned gate / attn pools from bundled checkpoint (if present)
+        if "mcfl" in ckpt:
+            mcfl.load_state_dict(ckpt["mcfl"], strict=True)
+        if learned_gate_refiner is not None and "learned_gate_refiner" in ckpt:
+            learned_gate_refiner.load_state_dict(ckpt["learned_gate_refiner"], strict=True)
+        if mcfl_pooling_mode == "attention":
+            if "attn_pool_text" in ckpt:
+                attn_pool_text.load_state_dict(ckpt["attn_pool_text"], strict=True)
+            if "attn_pool_audio" in ckpt:
+                attn_pool_audio.load_state_dict(ckpt["attn_pool_audio"], strict=True)
+
+        if dist.get_rank() == 0:
+            if "mcfl" not in ckpt and mcfl is not None:
+                logger.log(
+                    "WARN: checkpoint has no 'mcfl' weights; MCFL is randomly initialized. "
+                    "Re-save with latest TrainLoop.save() (bundled ckpt) or re-train."
+                )
+            if (
+                getattr(args, "learned_gate_enable", False)
+                and learned_gate_refiner is not None
+                and "learned_gate_refiner" not in ckpt
+            ):
+                logger.log(
+                    "WARN: learned_gate_enable=True but checkpoint has no 'learned_gate_refiner'; "
+                    "gate MLP is random. Use a checkpoint saved after bundling fix, or disable."
+                )
+
     # sampling
     for i in range(args.num_samples):
         batch = data.dataset.__getitem__(i) #sample_id
@@ -163,9 +207,7 @@ def main():
             c_temp = stft
         elif args.audio_emb_model == 'beats':
             audio = rearrange(audio.unsqueeze(0), "b f g -> (b f) g")
-            # 与训练一致（鲁棒 MCFL 音频归一化）：
-            # 数据侧 peak/soft_clip 已由 TAVDataset 根据 args.audio_norm_mode / args.audio_soft_clip 在加载时做完；
-            # 此处仅做单次 response（tanh/compand）再送 BEATs。采样时请传与训练相同的 --audio_norm_mode / --audio_soft_clip / --audio_response
+            # 与训练一致：BEATs 前单次 response（数据侧 audio_norm_mode/soft_clip 当前工程未接入，勿传）
             resp = getattr(args, 'audio_response', 'compand')
             if resp == 'tanh':
                 audio = th.tanh(audio)
@@ -176,6 +218,18 @@ def main():
             c_temp = BEATs_model.extract_features(audio.cpu(), padding_mask=None)[0] #torch.Size([16, 8, 768])
             # 处理完成后移回 GPU
             c_temp = c_temp.to(dist_util.dev())
+
+        # 与 train_temp 一致：对 BEATs token 做时间维 EMA，减轻条件帧间跳变
+        T = getattr(args, "sequence_length", 16)
+        if c_temp.dim() == 3 and c_temp.shape[0] % T == 0:
+            BT, M, D = c_temp.shape
+            B = BT // T
+            c_temp_reshaped = c_temp.view(B, T, M, D)
+            alpha = 0.9
+            c_smoothed = c_temp_reshaped.clone()
+            for t in range(1, T):
+                c_smoothed[:, t] = alpha * c_smoothed[:, t - 1] + (1 - alpha) * c_temp_reshaped[:, t]
+            c_temp = c_smoothed.view(BT, M, D)
         
         # Use common condition builder (shared with training)
         # MCFL v2-A: Temporal-only + Gated Residual
@@ -206,6 +260,9 @@ def main():
             mcfl_gate_av_sim_low=getattr(args, 'mcfl_gate_av_sim_low', 0.0),
             mcfl_gate_av_sim_high=getattr(args, 'mcfl_gate_av_sim_high', 0.3),
             mcfl_gate_av_beta=getattr(args, 'mcfl_gate_av_beta', 0.5),
+            learned_gate_refiner=learned_gate_refiner,
+            learned_gate_enable=getattr(args, "learned_gate_enable", False),
+            learned_gate_detach_input=getattr(args, "learned_gate_detach_input", True),
         )
         c_at = c_at.to(dist_util.dev())
         #c_temp = c_temp.to(dist_util.dev()) 
@@ -324,6 +381,10 @@ def create_argparser():
         mcfl_gate_av_sim_high=0.3,
         mcfl_gate_av_beta=0.5,
         audio_response='compand',  # 与训练稳健默认一致（单次压缩）
+        learned_gate_enable=False,
+        learned_gate_hidden_dim=16,
+        learned_gate_dropout=0.0,
+        learned_gate_detach_input=True,
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

@@ -111,6 +111,12 @@ def main():
         mcfl_gate_av_sim_low=getattr(args, 'mcfl_gate_av_sim_low', 0.0),
         mcfl_gate_av_sim_high=getattr(args, 'mcfl_gate_av_sim_high', 0.3),
         mcfl_gate_av_beta=getattr(args, 'mcfl_gate_av_beta', 0.5),
+        mcfl_collab_weight=getattr(args, 'mcfl_collab_weight', 0.0),  # 协同损失权重，0=关闭
+        learned_gate_enable=getattr(args, 'learned_gate_enable', False),
+        learned_gate_hidden_dim=getattr(args, 'learned_gate_hidden_dim', 16),
+        learned_gate_dropout=getattr(args, 'learned_gate_dropout', 0.0),
+        learned_gate_detach_input=getattr(args, 'learned_gate_detach_input', True),
+        learned_gate_reg_weight=getattr(args, 'learned_gate_reg_weight', 0.0),
     ).run_loop()
 
 
@@ -162,6 +168,14 @@ def create_argparser():
         mcfl_gate_av_sim_low=0.0,
         mcfl_gate_av_sim_high=0.3,
         mcfl_gate_av_beta=0.5,
+        # 协同损失：促进 image/audio token 对齐，0=关闭；建议 0.01/0.05/0.10，从 0.05 起步
+        mcfl_collab_weight=0.0,
+        # learned refinement gate: g = g_hand * sigmoid(MLP(x))
+        learned_gate_enable=False,
+        learned_gate_hidden_dim=16,
+        learned_gate_dropout=0.0,
+        learned_gate_detach_input=True,
+        learned_gate_reg_weight=0.0,
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
